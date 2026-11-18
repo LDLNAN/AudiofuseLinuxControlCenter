@@ -1,0 +1,45 @@
+# Original vendor installers, firmware images, and extracted proprietary reference files
+Original/
+/Original
+extracted/
+
+# Local Tephra coordination ledger
+.tephra/
+
+# Rust / Cargo build artifacts
+target/
+Cargo.lock
+
+# C / C++ / CMake / Meson build artifacts
+build/
+builddir/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Python / analysis artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+*.egg-info/
+
+# Packaging & distribution outputs
+*.AppImage
+*.deb
+*.rpm
+*.flatpak
+*.pkg.tar.*
+AppDir/
+.flatpak-builder/
+
+# Editor / OS metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
