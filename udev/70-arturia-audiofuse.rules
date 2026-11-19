@@ -7,3 +7,6 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="1c75", ATTR{idProduct}=="af0e", MODE="0660", 
 
 # Also match any hidraw or usb_device child nodes exposed by Arturia AudioFuse hardware
 KERNEL=="hidraw*", ATTRS{idVendor}=="1c75", ATTRS{idProduct}=="af0e", MODE="0660", GROUP="audio", TAG+="uaccess"
+
+# Non-intrusive EP0 coexistence helper character device (kmod/audiofuse8pre_ctl.c)
+KERNEL=="audiofuse8pre-ctl", SUBSYSTEM=="misc", MODE="0666", GROUP="audio", TAG+="uaccess"

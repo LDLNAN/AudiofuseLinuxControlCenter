@@ -9,7 +9,7 @@ extracted/
 # Rust / Cargo build artifacts
 target/
 
-# C / C++ / CMake / Meson build artifacts
+# C / C++ / CMake / Meson / Kbuild build artifacts
 build/
 builddir/
 cmake-build-*/
@@ -18,6 +18,13 @@ cmake-build-*/
 *.so
 *.dylib
 *.dll
+kmod/*.ko
+kmod/*.mod
+kmod/*.mod.c
+kmod/.*.cmd
+kmod/.module-common.o
+kmod/Module.symvers
+kmod/modules.order
 
 # Python / analysis artifacts
 __pycache__/

@@ -14,11 +14,11 @@ While the Arturia AudioFuse 8Pre (`1c75:af0e`) enumerates as a USB Audio Class 2
    - **Master Cue & Monitor Section**: Direct/Computer Mix balance, Master Cue Output Level/Mute/Solo, Speakers routing (`Main 1-2` / `Cue Mix`) + Mono sum, and Headphones routing (`Main 1-2` / `Cue Mix` / `Follow Spkrs`) + Mono sum.
    - **Output & Loopback Routing Matrix**: Independent stereo pair routing for `Analog Out 1–2`, `3–4`, `5–6`, `7–8` (`Cue Mix`, `USB`, `Analog In`, `ADAT In`), `ADAT Out 1–2`, `3–4`, `5–6`, `7–8` (`Cue Mix`, `USB 9–16`, `Analog In 1–8`), and recording `Loopback` (`Disabled`, `Cue Mix`, `USB 17–18`).
    - **Clocking & Hardware Configuration**: Device Mode (`USB` interface vs. standalone `ADAT` 8-channel expander), Sample Rate (`44.1` / `48` / `88.2` / `96 kHz`), Clock Source (`Internal`, `Word Clock`, `ADAT`) with lock status, Word Clock `75 Ω` termination (`On` / `Hi-Z`), Word Clock Thru (`Off` / `On`), ADAT Enable, and S/MUX mode (`Normal` / `Double Speed`).
-   - **Real-Time Hardware VU Metering**: Live 78-byte bulk state / VU polling across all Analog, ADAT, USB, Cue Mix, Speaker, Headphone, and Loopback channels.
-   - **Device Presets & Persistence**: On-device preset load/save (`PresetLoad` / `PresetSave`), local preset file import/export, and CLI/daemon state restoration on boot/hotplug.
-   - **Firmware Inspection & Update Support**: Firmware version readout (`bcdDevice` / `.af8pre` archive inspection) and USB DFU (Interface 3) update workflow.
+   - **Real-Time Hardware VU Metering**: Live 152-byte (`Unit 0x11`, `38 × i32` 24-bit linear peaks) VU polling across all Analog, ADAT, USB, Cue Mix, Speaker, Headphone, and Loopback channels alongside atomic 266-byte (`Unit 0x0d`) hardware state snapshots.
+   - **Device Presets & Persistence**: Local JSON preset file import/export (`preset export` / `preset import`) and CLI state restoration on boot/hotplug.
+   - **Firmware Inspection**: Firmware version readout (`bcdDevice`) and offline `.af8pre` archive inspection (runtime DFU queries on Interface 3 are blocked to protect active audio streaming).
 2. **Universal Linux Distribution Packaging**:
-   - Portable standalone binaries and cross-distro distribution formats (`AppImage`, `Flatpak`, `.deb`, `.rpm`, Arch `PKGBUILD`) alongside non-root `udev` rules (`1c75:af0e`) so any Linux studio setup works out of the box without root privileges.
+   - Portable standalone binaries and cross-distro distribution formats (`AppImage`, `Flatpak`, `.deb`, `.rpm`, Arch `PKGBUILD`) alongside non-root `udev` rules (`1c75:af0e`) and the non-intrusive Linux EP0 coexistence helper (`kmod/audiofuse8pre_ctl.c` -> `/dev/audiofuse8pre-ctl`) so live hardware control and VU metering work alongside active `snd-usb-audio` / PipeWire streams without ever detaching ALSA.
    - Both a full desktop GUI and a scriptable CLI (`audiofuse-cli`) for headless/PipeWire/ALSA session automation.
 3. **Defined Project Lifecycle**:
    - **End-Goal**: 100% feature parity with the official Windows AudioFuse Control Center for the AudioFuse 8Pre.
@@ -44,13 +44,14 @@ Like [mousetool](https://github.com/LDLNAN/mousetool), this project enforces a s
 | Property | Value |
 | :--- | :--- |
 | **USB Vendor / Product ID** | `1c75:af0e` (`Arturia AudioFuse 8Pre`) |
-| **Interface 0** | USB Audio Class 2.0 Control + Vendor Control Transfers (`ep_82` interrupt IN) |
-| **Interface 1 & 2** | UAC2 Audio Streaming OUT (`ep_01`, 18 ch 24-bit) & IN (`ep_81`, 18 ch 24-bit) |
-| **Interface 3** | USB DFU (`bInterfaceClass 0xfe`, `bInterfaceSubClass 0x01`, 64-byte transfer size) |
-| **UAC2 Clock Entities** | Clock Selector `40` (`0x28`): `41` (`0x29` Internal), `43` (`0x2B` ADAT), `44` (`0x2C` Word Clock); Extension Unit `30` (`0x1E`) |
-| **Vendor Control Unit** | `AFEXDevice` unit ID `0x0a` (`10`), 16-bit parameter values (`2` bytes), `0x4e` (`78` bytes) bulk state/VU payload |
+| **Interface 0** | USB Audio Class 2.0 Control + AFEX EP0 Control Transfers (`bRequest = 0x03` MEM / `0x01` CUR) |
+| **Interface 1 & 2** | UAC2 Audio Streaming OUT (`ep_01`, 18 ch 24-bit) & IN (`ep_81`, 18 ch 24-bit) — owned by `snd-usb-audio`, never touched |
+| **Interface 3** | USB DFU (`bInterfaceClass 0xfe`, `bInterfaceSubClass 0x01`, 64-byte transfer size) — blocked at runtime |
+| **UAC2 Clock Entities** | Clock Selector `40` (`0x28`): Pin 1 -> `41` (`0x29` Internal), Pin 2 -> `43` (`0x2B` WORD Clock), Pin 3 -> `44` (`0x2C` ADAT Clock) |
+| **AFEX Control Units** | Unit `0x0a` (parameter writes/reads), Unit `0x0d` (266-byte full hardware state snapshot), Unit `0x11` (152-byte live VU meters) |
+| **Linux ALSA Coexistence** | `kmod/audiofuse8pre_ctl.c` (`/dev/audiofuse8pre-ctl`) dispatches whitelisted EP0 Interface 0 transfers alongside active `snd-usb-audio` / PipeWire streams |
 
-See [`docs/PROTOCOL.md`](./docs/PROTOCOL.md) for the reverse-engineered parameter map, USB control transfer specification, and UI layout mapping.
+See [`docs/PROTOCOL.md`](./docs/PROTOCOL.md) for the complete clean-room verified parameter map, USB control transfer specification, Q8.8 constant-power pan math, and Linux coexistence design.
 
 ---
 

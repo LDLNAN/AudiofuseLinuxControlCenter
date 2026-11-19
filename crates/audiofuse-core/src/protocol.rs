@@ -1,7 +1,9 @@
-//! Protocol constants, USB control requests, UAC2 entities, parameter IDs,
-//! and piecewise-linear dB scaling for the Arturia AudioFuse 8Pre (`1c75:af0e`).
+//! Clean-room verified protocol constants, USB/UAC2 control requests,
+//! AFEX unit/parameter IDs, Q8.8 constant-power pan math, 1-hot routing masks,
+//! and 24-bit VU meter scaling for the Arturia AudioFuse 8Pre (`1c75:af0e`).
 
 use serde::{Deserialize, Serialize};
+use std::f32::consts::FRAC_PI_2;
 use std::fmt;
 
 /// Arturia USB Vendor ID (`0x1c75`).
@@ -10,25 +12,56 @@ pub const ARTURIA_VENDOR_ID: u16 = 0x1c75;
 /// Arturia AudioFuse 8Pre Product ID (`0xaf0e`).
 pub const AUDIOFUSE_8PRE_PRODUCT_ID: u16 = 0xaf0e;
 
-/// Vendor control unit ID (`AFEXDevice` unit `0x0a` / `10`).
+/// AFEX parameter write/read unit ID (`0x0a` / `10`).
 pub const AFEX_UNIT_ID: u8 = 0x0a;
 
-/// USB Interface 0: UAC2 Audio Control + Vendor Control Transfers.
+/// AFEX hardware state snapshot unit ID (`0x0d` / `13`).
+pub const AFEX_STATE_UNIT_ID: u8 = 0x0d;
+
+/// AFEX real-time VU meter telemetry unit ID (`0x11` / `17`).
+pub const AFEX_VU_UNIT_ID: u8 = 0x11;
+
+/// USB Interface 0: UAC2 Audio Control + AFEX EP0 Vendor Control Transfers.
 pub const UAC2_CONTROL_INTERFACE: u8 = 0x00;
 
 /// USB Interface 3: USB DFU (`bInterfaceClass 0xfe`, `bInterfaceSubClass 0x01`).
+/// Blocked at runtime to protect active audio streaming.
 pub const DFU_INTERFACE: u8 = 0x03;
 
 /// DFU transfer block size (`wTransferSize = 64` bytes).
 pub const DFU_TRANSFER_SIZE: usize = 64;
 
-/// Parameter payload size (`uint16_t` little-endian = 2 bytes).
+/// Standard scalar AFEX parameter payload size (`u16`/`i16` little-endian = 2 bytes).
 pub const PARAM_VALUE_SIZE: usize = 2;
 
-/// Bulk hardware state & real-time VU meter payload size (`0x4e` = 78 bytes).
+/// Verified full hardware state snapshot payload size from Unit `0x0d` (`wValue = 0x0002`): `266` (`0x010a`) bytes.
+pub const AFEX_STATE_SIZE: usize = 266;
+
+/// Verified real-time VU telemetry payload size from Unit `0x11` (`wValue = 0x0000`): `152` (`0x98`) bytes (`38 × i32` LE).
+pub const AFEX_VU_SIZE: usize = 152;
+
+/// Number of signed 32-bit peak meter slots in the 152-byte Unit `0x11` VU payload.
+pub const AFEX_VU_CHANNELS: usize = 38;
+
+/// Verified 6-byte magic header at offset `0x00..0x06` of the 266-byte Unit `0x0d` state snapshot.
+pub const AFEX_STATE_MAGIC: [u8; 6] = [0xca, 0xde, 0xca, 0xde, 0x01, 0x00];
+
+/// `wValue` selector for reading the full 266-byte state snapshot from Unit `0x0d`.
+pub const AFEX_STATE_WVALUE_FULL: u16 = 0x0002;
+
+/// `wValue` selector for reading the 56-byte front-panel hardware sub-block from Unit `0x0d`.
+pub const AFEX_STATE_WVALUE_HW_BLOCK: u16 = 0x0000;
+
+/// `wValue` selector for reading the 204-byte DSP sub-block from Unit `0x0d`.
+pub const AFEX_STATE_WVALUE_DSP_BLOCK: u16 = 0x0001;
+
+/// Channel byte used in `wValue` for global (non-indexed) AFEX parameters (`0xff`).
+pub const AFEX_GLOBAL_CHANNEL: u8 = 0xff;
+
+/// Legacy 78-byte (`0x4e`) simulator preset-slot buffer size (not a hardware USB transfer).
 pub const BULK_STATE_VU_SIZE: usize = 0x4e; // 78
 
-/// Maximum ASCII string length stored on device (`Device Name`, `Mixer Ch Name`).
+/// Maximum ASCII string length stored on device (`Device Name`) and host channel labels.
 pub const MAX_DEVICE_STRING_LEN: usize = 16;
 
 /// USB `bmRequestType` for Class Interface IN (`0xa1`: Device-to-Host, Class, Interface).
@@ -37,28 +70,22 @@ pub const USB_REQ_CLASS_INTERFACE_IN: u8 = 0xa1;
 /// USB `bmRequestType` for Class Interface OUT (`0x21`: Host-to-Device, Class, Interface).
 pub const USB_REQ_CLASS_INTERFACE_OUT: u8 = 0x21;
 
-/// UAC2 Request Code: `CUR` (`0x01` - Current setting attribute).
+/// UAC2 Request Code: `CUR` (`0x01` - Current setting attribute, used for UAC2 Clock entities).
 pub const UAC2_REQ_CUR: u8 = 0x01;
 
-/// Vendor Request Code base for `GetString(type, index)` (`0x98 + type`).
-pub const REQ_GET_STRING_BASE: u8 = 0x98;
+/// UAC2 Request Code: `RANGE` (`0x02` - Range attribute).
+pub const UAC2_REQ_RANGE: u8 = 0x02;
 
-/// Vendor Request Code base for `SetString(type, index, str)` (`0x18 + type`).
-pub const REQ_SET_STRING_BASE: u8 = 0x18;
+/// UAC2 Request Code: `MEM` (`0x03` - Memory request, used for all AFEX state/VU/parameter transfers).
+pub const UAC2_REQ_MEM: u8 = 0x03;
 
-/// Vendor Request Code for `PresetLoad(slot, buf, len)` (`0x48`).
-pub const REQ_PRESET_LOAD: u8 = 0x48;
-
-/// Vendor Request Code for `PresetSave(slot, buf, len)` (`0x49`).
-pub const REQ_PRESET_SAVE: u8 = 0x49;
-
-/// String type `0`: Global device name (`"AudioFuse 8Pre"`).
+/// String type `0`: Global device name (backed on hardware by `param_id::DEVICE_NAME = 0x68`, 16 bytes).
 pub const STRING_TYPE_DEVICE_NAME: u8 = 0x00;
 
-/// String type `1`: Mixer channel name (`idx = 0..23`).
+/// String type `1`: Mixer channel name (`idx = 0..23`, host-side only on AudioFuse 8Pre).
 pub const STRING_TYPE_CHANNEL_NAME: u8 = 0x01;
 
-// --- UAC2 Audio Control Entities (Interface 0) ---
+// --- UAC2 Audio Control Entities (Interface 0, verified from live USB descriptors & ALSA) ---
 
 /// Entity `1` (`0x01`): USB Streaming Input Terminal (18 ch).
 pub const UAC2_ENTITY_USB_IN_TERMINAL: u8 = 0x01;
@@ -70,14 +97,14 @@ pub const UAC2_ENTITY_HW_OUT_TERMINAL: u8 = 0x14;
 pub const UAC2_ENTITY_USB_OUT_TERMINAL: u8 = 0x16;
 /// Entity `30` (`0x1E`): Vendor Extension Unit.
 pub const UAC2_ENTITY_EXTENSION_UNIT: u8 = 0x1e;
-/// Entity `40` (`0x28`): `"ARTURIA Clock Selector"` (3 pins: 1->41, 2->43, 3->44).
+/// Entity `40` (`0x28`): `"ARTURIA Clock Selector"` (3 pins: `1 -> 41 Internal`, `2 -> 43 WORD`, `3 -> 44 ADAT`).
 pub const UAC2_ENTITY_CLOCK_SELECTOR: u8 = 0x28;
 /// Entity `41` (`0x29`): `"Internal Clock"` (Programmable frequency + validity).
 pub const UAC2_ENTITY_CLOCK_INTERNAL: u8 = 0x29;
-/// Entity `43` (`0x2B`): `"ADAT Clock"` (External clock validity).
-pub const UAC2_ENTITY_CLOCK_ADAT: u8 = 0x2b;
-/// Entity `44` (`0x2C`): `"WORD Clock"` (External clock validity).
-pub const UAC2_ENTITY_CLOCK_WORD: u8 = 0x2c;
+/// Entity `43` (`0x2B`): `"WORD Clock"` (External BNC clock validity, Selector Pin 2).
+pub const UAC2_ENTITY_CLOCK_WORD: u8 = 0x2b;
+/// Entity `44` (`0x2C`): `"ADAT Clock"` (External optical clock validity, Selector Pin 3).
+pub const UAC2_ENTITY_CLOCK_ADAT: u8 = 0x2c;
 
 /// UAC2 Clock Selector Control Selector (`CS_CLOCK_SELECTOR_CONTROL = 0x01`).
 pub const UAC2_CS_CLOCK_SELECTOR_CONTROL: u8 = 0x01;
@@ -86,68 +113,111 @@ pub const UAC2_CS_SAM_FREQ_CONTROL: u8 = 0x01;
 /// UAC2 Clock Validity Control Selector (`CS_CLOCK_VALID_CONTROL = 0x02`).
 pub const UAC2_CS_CLOCK_VALID_CONTROL: u8 = 0x02;
 
-// --- Parameter IDs (`AudiofuseExStateController` table) ---
+// --- Verified Hardware Parameter IDs (AFEX Unit 0x0a, offset in 266-byte Unit 0x0d struct = param_id * 2) ---
 
-/// Global parameter IDs (`idx = 0`).
+/// Clean-room verified AFEX parameter IDs for the AudioFuse 8Pre (`1c75:af0e`).
+/// Every ID `p` maps directly to byte offset `p * 2` in the 266-byte Unit `0x0d` state snapshot.
 pub mod param_id {
-    /// `0x05` (`5`): `Device Mode` (`0` = USB, `1` = ADAT).
-    pub const DEVICE_MODE: u8 = 0x05;
-    /// `0x06` (`6`): `ADAT On` (`0` = Off, `1` = On).
-    pub const ADAT_ON: u8 = 0x06;
-    /// `0x08` (`8`): `Wordclock Impedance` (`0` = 75 Ohms On, `1` = HiZ Off).
-    pub const WORDCLOCK_IMPEDANCE: u8 = 0x08;
-    /// `0x09` (`9`): `Wordclock Thru` (`0` = Off, `1` = On).
-    pub const WORDCLOCK_THRU: u8 = 0x09;
-    /// `0x0a` (`10`): `SMUX Mode` (`0` = Normal, `1` = Double Speed).
-    pub const SMUX_MODE: u8 = 0x0a;
+    /// `0x03` (`+0x006`, `u16`, read-only): Front-panel 56-byte hardware block generation counter.
+    pub const HW_BLOCK_GEN: u8 = 0x03;
 
-    /// `0x10` (`16`), `idx = 0..7`: Input Type / Mic / Jack state.
-    pub const INPUT_TYPE: u8 = 0x10;
-    /// `0x11` (`17`), `idx = 0..7`: Input PAD / Boost (Line PAD in bit/byte or enum, Mic PAD/Boost).
-    pub const INPUT_PAD_BOOST: u8 = 0x11;
-    /// `0x12` (`18`), `idx = 0..7`: Input +48V Phantom Power (`0` = Off, `1` = +48V On).
-    pub const INPUT_PHANTOM: u8 = 0x12;
-    /// `0x13` (`19`), `idx = 0..7`: Input Phase Invert (`0` = Normal, `1` = Inverted).
-    pub const INPUT_PHASE_INVERT: u8 = 0x13;
-    /// `0x14` (`20`), `idx = 0..7`: Input Line Pad (`0` = Off, `1` = -20dB).
-    pub const INPUT_PAD_LINE: u8 = 0x14;
-    /// `0x18` (`24`), `idx = 0..1`: Input 1-2 Instrument (`Hi-Z`) mode.
-    pub const INPUT_INST: u8 = 0x18;
+    /// `0x04` (`+0x008..0x017`, `8 × u16`, `ch = 0..7`): `Input 1..8 PAD Mic` (`0 = OFF`, `1 = PAD -20dB`, `2 = BOOST`).
+    pub const INPUT_PAD_MIC: u8 = 0x04;
+    /// Backwards-compatible alias for [`INPUT_PAD_MIC`].
+    pub const INPUT_PAD_BOOST: u8 = INPUT_PAD_MIC;
 
-    /// `0x20` (`32`), `idx = 0..23`: Cue Mixer Channel Mute (`0..7` Analog, `8..15` ADAT, `16..23` USB).
-    pub const MIXER_CH_MUTE: u8 = 0x20;
-    /// `0x21` (`33`), `idx = 0..23`: Cue Mixer Channel Solo (`0..7` Analog, `8..15` ADAT, `16..23` USB).
-    pub const MIXER_CH_SOLO: u8 = 0x21;
-    /// `0x22` (`34`), `idx = 0..23`: Cue Mixer Channel Pan (`-64..+64` encoded as `0..128` or signed `i16`).
-    pub const MIXER_CH_PAN: u8 = 0x22;
-    /// `0x23` (`35`), `idx = 0..23`: Cue Mixer Channel Level (`PiecewiseLinear(0.842105263)` encoded `0..1000`).
-    pub const MIXER_CH_LEVEL: u8 = 0x23;
+    /// `0x0c` (`+0x018`, `u16` bitmask, `ch = 0..7`): `Input 1..8 PAD Line` (`0 = Off`, `1 = -20dB`).
+    pub const INPUT_PAD_LINE: u8 = 0x0c;
 
-    /// `0x30` (`48`), `idx = 0`: `Mixer Output Mute`.
-    pub const MIXER_OUT_MUTE: u8 = 0x30;
-    /// `0x31` (`49`), `idx = 0`: `Mixer Output Level` (`-61.0..0.0` dB).
-    pub const MIXER_OUT_LEVEL: u8 = 0x31;
-    /// `0x32` (`50`), `idx = 0`: `Mixer Output Solo`.
-    pub const MIXER_OUT_SOLO: u8 = 0x32;
-    /// `0x33` (`51`), `idx = 0`: `Direct/Computer Mix` (`0.0..1.0` -> `0..1000`).
-    pub const DIRECT_COMPUTER_MIX: u8 = 0x33;
+    /// `0x0d` (`+0x01a`, `u16` bitmask, `ch = 0..1`): `Input 1..2 Inst` (`0 = Off`, `1 = Hi-Z Instrument`).
+    pub const INPUT_INST: u8 = 0x0d;
 
-    /// `0x38` (`56`), `idx = 0`: `Speakers Source` (`0` = Main 1-2, `1` = Cue Mix).
-    pub const SPEAKERS_SOURCE: u8 = 0x38;
-    /// `0x39` (`57`), `idx = 0`: `Speakers Mono` (`0` = Stereo, `1` = Mono).
-    pub const SPEAKERS_MONO: u8 = 0x39;
+    /// `0x0e` (`+0x01c`, `u16` bitmask, `ch = 0..7`): `Input 1..8 Phase Invert` (`0 = Normal`, `1 = Inverted`).
+    pub const INPUT_PHASE_INVERT: u8 = 0x0e;
 
-    /// `0x40` (`64`), `idx = 0`: `Phones Source` (`0` = Main 1-2, `1` = Cue Mix, `2` = Follow Spkrs).
-    pub const PHONES_SOURCE: u8 = 0x40;
-    /// `0x41` (`65`), `idx = 0`: `Phones Mono` (`0` = Stereo, `1` = Mono).
-    pub const PHONES_MONO: u8 = 0x41;
+    /// `0x0f` (`+0x01e`, `u16`, `ch = 0xff`): `Speakers Source` (`0 = Main 1-2`, `1 = Cue Mix`).
+    pub const SPEAKERS_SOURCE: u8 = 0x0f;
 
-    /// `0x48` (`72`), `idx = 0..3`: `Analog 1-2..7-8 Source`.
-    pub const ANALOG_OUT_SOURCE: u8 = 0x48;
-    /// `0x49` (`73`), `idx = 0..3`: `ADAT 1-2..7-8 Source`.
-    pub const ADAT_OUT_SOURCE: u8 = 0x49;
-    /// `0x4a` (`74`), `idx = 0`: `Loopback Source`.
-    pub const LOOPBACK_SOURCE: u8 = 0x4a;
+    /// `0x10` (`+0x020`, `u16`, `ch = 0xff`): `Phones Source` (`0 = Main 1-2`, `1 = Cue Mix`, `2 = Follow Speakers`).
+    pub const PHONES_SOURCE: u8 = 0x10;
+
+    /// `0x11` (`+0x022`, `u16`, `ch = 0xff`): `Speakers Mono` (`0 = Stereo`, `1 = Mono`).
+    pub const SPEAKERS_MONO: u8 = 0x11;
+
+    /// `0x12` (`+0x024`, `u16`, `ch = 0xff`): `Phones Mono` (`0 = Stereo`, `1 = Mono`).
+    pub const PHONES_MONO: u8 = 0x12;
+
+    /// `0x13` (`+0x026`, `u16` bitmask, `ch = 0..7`): `Input 1..8 Phantom (+48V)` (`0 = Off`, `1 = +48V`).
+    pub const INPUT_PHANTOM: u8 = 0x13;
+
+    /// `0x14` (`+0x028`, `u16` bitmask, read-only): Front-panel jack sense for Ch 1-2.
+    pub const INPUT_FRONT_JACK_SENSE: u8 = 0x14;
+
+    /// `0x15` (`+0x02a..0x03d`, `10 × u16`, read-only): Hardware connector sense (`0 = Unplugged`, `1 = Mic XLR`, `2 = Line TRS`).
+    pub const INPUT_JACK_SENSE: u8 = 0x15;
+
+    /// `0x1f` (`+0x03e`, `u16`, read-only): DSP 204-byte block generation counter.
+    pub const DSP_BLOCK_GEN: u8 = 0x1f;
+
+    /// `0x20` (`+0x040..0x06f`, `24 × i16`, `ch = 0..23`): Cue Mixer Channel Left Gain in Q8.8 dB (`-32768 = -inf`).
+    pub const MIXER_CH_GAIN_L: u8 = 0x20;
+
+    /// `0x38` (`+0x070..0x09f`, `24 × i16`, `ch = 0..23`): Cue Mixer Channel Right Gain in Q8.8 dB (`-32768 = -inf`).
+    pub const MIXER_CH_GAIN_R: u8 = 0x38;
+
+    /// `0x50` (`+0x0a0`, `u16` bitmask, `ch = 0..15`): Cue Mixer Mute for Analog 1..8 (`0..7`) + ADAT 1..8 (`8..15`).
+    pub const MIXER_MUTE_ANALOG_ADAT: u8 = 0x50;
+
+    /// `0x51` (`+0x0a2`, `u16` bitmask, `ch = 0..7`): Cue Mixer Mute for USB 1..8 (`0..7`).
+    pub const MIXER_MUTE_USB: u8 = 0x51;
+
+    /// `0x52` (`+0x0a4`, `u16` bitmask, `ch = 0..15`): Cue Mixer Solo for Analog 1..8 (`0..7`) + ADAT 1..8 (`8..15`).
+    pub const MIXER_SOLO_ANALOG_ADAT: u8 = 0x52;
+
+    /// `0x53` (`+0x0a6`, `u16` bitmask, `ch = 0..7`): Cue Mixer Solo for USB 1..8 (`0..7`).
+    pub const MIXER_SOLO_USB: u8 = 0x53;
+
+    /// `0x55` (`+0x0aa`, `i16`, `ch = 0xff`): `Mixer Output Level` (Master Cue Level) in Q8.8 dB (`-61.0..=0.0 dB`, `-32768 = -inf`).
+    pub const MIXER_OUT_LEVEL: u8 = 0x55;
+
+    /// `0x56` (`+0x0ac`, `u16` bitmask, `ch = 0..7`): `Mixer USB 1..8 Show`.
+    pub const MIXER_SHOW_USB: u8 = 0x56;
+
+    /// `0x57` (`+0x0ae`, `u16` bitmask, `ch = 0..15`): `Mixer Analog 1..8 + ADAT 1..8 Show`.
+    pub const MIXER_SHOW_ANALOG_ADAT: u8 = 0x57;
+
+    /// `0x58` (`+0x0b0`, `u16` bitmask, `ch = 0..11`): `Mixer Stereo Show / Link` (`0..3` Analog, `4..7` ADAT, `8..11` USB).
+    pub const MIXER_STEREO_SHOW: u8 = 0x58;
+
+    /// `0x66` (`+0x0cc`, `u16`, `ch = 0xff`): `Device Mode` (`0 = USB`, `1 = ADAT`).
+    pub const DEVICE_MODE: u8 = 0x66;
+
+    /// `0x68` (`+0x0d0..0x0df`, 16 bytes ASCII space-padded, `ch = 0xff`, `wLength = 16`): `Device Name`.
+    pub const DEVICE_NAME: u8 = 0x68;
+
+    /// `0x70` (`+0x0e0`, `u16`, `ch = 0xff`): `Wordclock Impedance` (`0 = 75 Ohms On`, `1 = HiZ Off`).
+    pub const WORDCLOCK_IMPEDANCE: u8 = 0x70;
+
+    /// `0x71` (`+0x0e2`, `u16`, `ch = 0xff`): `Wordclock Thru` (`0 = Off`, `1 = On`).
+    pub const WORDCLOCK_THRU: u8 = 0x71;
+
+    /// `0x72` (`+0x0e4..0x0f3`, 16 bytes ASCII, read-only): Hardware Serial Number.
+    pub const SERIAL_NUMBER: u8 = 0x72;
+
+    /// `0x7a` (`+0x0f4..0x0fb`, `4 × u16`, `ch = 0..3`): `Analog Out 1-2..7-8 Source` (1-hot bitmask `1/2/4/8`).
+    pub const ANALOG_OUT_SOURCE: u8 = 0x7a;
+
+    /// `0x7e` (`+0x0fc..0x103`, `4 × u16`, `ch = 0..3`): `ADAT Out 1-2..7-8 Source` (1-hot bitmask `1/2/4`).
+    pub const ADAT_OUT_SOURCE: u8 = 0x7e;
+
+    /// `0x82` (`+0x104`, `u16`, `ch = 0xff`): `Loopback Source` (`0 = Disabled`, `1 = Cue Mix`, `2 = USB 17-18`).
+    pub const LOOPBACK_SOURCE: u8 = 0x82;
+
+    /// `0x83` (`+0x106`, `u16`, `ch = 0x00`): `SMUX Mode` (`0 = Normal`, `1 = Double Speed`).
+    pub const SMUX_MODE: u8 = 0x83;
+
+    /// `0x84` (`+0x108`, `u16`, `ch = 0xff`): `ADAT On` / status.
+    pub const ADAT_ON: u8 = 0x84;
 }
 
 /// Construct the 16-bit `wValue` for `AFEXDevice::GetParameter` / `SetParameter`:
@@ -164,23 +234,24 @@ pub const fn decode_param_wvalue(wvalue: u16) -> (u8, u8) {
 }
 
 /// Construct the 16-bit `wIndex` for unit-addressed control transfers on Interface 0:
-/// `wIndex = ((unit_id as u16) << 8) | (interface_num as u16)` (`0x0a00` for `AFEXDevice`).
+/// `wIndex = ((unit_id as u16) << 8) | (interface_num as u16)`.
 #[inline]
 pub const fn encode_unit_windex(unit_id: u8, interface_num: u8) -> u16 {
     ((unit_id as u16) << 8) | (interface_num as u16)
 }
 
-/// Default `wIndex` for `AFEXDevice` unit `0x0a` on Interface `0x00` (`0x0a00`).
+/// Default `wIndex` for AFEX parameter unit `0x0a` on Interface `0x00` (`0x0a00`).
 pub const AFEX_DEFAULT_WINDEX: u16 = encode_unit_windex(AFEX_UNIT_ID, UAC2_CONTROL_INTERFACE);
 
-// --- PiecewiseLinear(0.842105263) Fader Scaling ---
+/// `wIndex` for AFEX state snapshot unit `0x0d` on Interface `0x00` (`0x0d00`).
+pub const AFEX_STATE_WINDEX: u16 = encode_unit_windex(AFEX_STATE_UNIT_ID, UAC2_CONTROL_INTERFACE);
+
+/// `wIndex` for AFEX live VU meter telemetry unit `0x11` on Interface `0x00` (`0x1100`).
+pub const AFEX_VU_WINDEX: u16 = encode_unit_windex(AFEX_VU_UNIT_ID, UAC2_CONTROL_INTERFACE);
+
+// --- PiecewiseLinear(0.842105263) UI Fader Scaling ---
 
 /// Knee position for `PiecewiseLinear(0.842105263)` mixer fader law (`0.842105263` = `16/19` ≈ `0.0 dB` unity knee).
-///
-/// The fader range is `-61.0 dB` to `+12.0 dB` (`73.0 dB` total span):
-/// - Normalized `t = 0.0` -> `-61.0 dB` (displayed as `-inf` when `< -60.5 dB`)
-/// - Normalized `t = 0.842105263` -> `0.0 dB` (unity gain)
-/// - Normalized `t = 1.0` -> `+12.0 dB`
 pub const MIXER_FADER_KNEE: f32 = 0.842_105_27;
 /// Minimum mixer channel level in dB (`-61.0 dB`).
 pub const MIXER_FADER_MIN_DB: f32 = -61.0;
@@ -217,31 +288,109 @@ pub fn fader_db_to_normalized(db: f32) -> f32 {
     }
 }
 
-/// Encode mixer channel level in dB (`-61.0..=+12.0`) to raw 16-bit parameter value (`0..=1000`).
+/// Legacy 0..=1000 fader helper (used in simulator preset slot serialization).
 pub fn encode_mixer_fader_db(db: f32) -> u16 {
     let norm = fader_db_to_normalized(db);
     (norm * 1000.0).round() as u16
 }
 
-/// Decode raw 16-bit parameter value (`0..=1000`) to mixer channel level in dB (`-61.0..=+12.0`).
+/// Legacy 0..=1000 fader helper (used in simulator preset slot serialization).
 pub fn decode_mixer_fader_db(raw: u16) -> f32 {
     let norm = (raw.min(1000) as f32) / 1000.0;
     let db = fader_normalized_to_db(norm);
     (db * 10.0).round() / 10.0
 }
 
-/// Encode master output level in dB (`-61.0..=0.0`, Linear) to raw 16-bit parameter value (`0..=1000`).
+/// Legacy 0..=1000 master level helper (used in simulator preset slot serialization).
 pub fn encode_master_level_db(db: f32) -> u16 {
     let db = db.clamp(MIXER_FADER_MIN_DB, 0.0);
     let norm = (db - MIXER_FADER_MIN_DB) / (0.0 - MIXER_FADER_MIN_DB);
     (norm * 1000.0).round() as u16
 }
 
-/// Decode raw 16-bit parameter value (`0..=1000`) to master output level in dB (`-61.0..=0.0`).
+/// Legacy 0..=1000 master level helper (used in simulator preset slot serialization).
 pub fn decode_master_level_db(raw: u16) -> f32 {
     let norm = (raw.min(1000) as f32) / 1000.0;
     let db = MIXER_FADER_MIN_DB + norm * (0.0 - MIXER_FADER_MIN_DB);
     (db * 10.0).round() / 10.0
+}
+
+// --- Verified Hardware Q8.8 dB & Constant-Power Pan Law (0x20, 0x38, 0x55) ---
+
+/// Encode a dB level (`-61.0..=0.0` dB) into hardware signed Q8.8 fixed-point (`1/256 dB`)
+/// for `Mixer Output Level` (`param_id = 0x55`). Values `<= -60.5 dB` encode as `-32768` (`-inf`).
+pub fn encode_master_level_q88(db: f32) -> i16 {
+    let clamped = db.clamp(MIXER_FADER_MIN_DB, 0.0);
+    if clamped < MIXER_FADER_NEG_INF_THRESHOLD_DB {
+        i16::MIN
+    } else {
+        (clamped * 256.0).round().clamp(-32767.0, 0.0) as i16
+    }
+}
+
+/// Decode a hardware signed Q8.8 fixed-point master level (`param_id = 0x55`) into dB (`-61.0..=0.0`).
+pub fn decode_master_level_q88(raw: i16) -> f32 {
+    if raw == i16::MIN {
+        MIXER_FADER_MIN_DB
+    } else {
+        let db = (raw as f32 / 256.0).clamp(MIXER_FADER_MIN_DB, 0.0);
+        (db * 10.0).round() / 10.0
+    }
+}
+
+/// Encode `(level_db, pan)` into hardware Q8.8 dB `(gain_l, gain_r)` pairs (`0x20`, `0x38`)
+/// using the verified constant-power cosine/sine pan law.
+pub fn encode_mixer_channel_gains_q88(level_db: f32, pan: i8) -> (i16, i16) {
+    let clamped_db = level_db.clamp(MIXER_FADER_MIN_DB, MIXER_FADER_MAX_DB);
+    if clamped_db < MIXER_FADER_NEG_INF_THRESHOLD_DB {
+        return (i16::MIN, i16::MIN);
+    }
+    let pan_clamped = pan.clamp(-64, 64);
+    let pan_norm = ((pan_clamped as f32) + 64.0) / 128.0;
+    let theta = pan_norm * FRAC_PI_2;
+    let amp = 10.0_f32.powf(clamped_db / 20.0);
+
+    let l_lin = amp * theta.cos();
+    let r_lin = amp * theta.sin();
+
+    let to_q88 = |lin: f32| -> i16 {
+        if lin <= 1e-6 {
+            i16::MIN
+        } else {
+            let db = 20.0 * lin.log10();
+            if db < -127.0 {
+                i16::MIN
+            } else {
+                (db * 256.0).round().clamp(-32767.0, 32767.0) as i16
+            }
+        }
+    };
+
+    (to_q88(l_lin), to_q88(r_lin))
+}
+
+/// Decode hardware Q8.8 dB `(gain_l, gain_r)` pairs (`0x20`, `0x38`) back into `(level_db, pan)`
+/// using the inverse constant-power pan law (`hypot` + `atan2`).
+pub fn decode_mixer_channel_gains_q88(gain_l: i16, gain_r: i16) -> (f32, i8) {
+    let q88_to_lin = |raw: i16| -> f32 {
+        if raw == i16::MIN {
+            0.0
+        } else {
+            10.0_f32.powf((raw as f32 / 256.0) / 20.0)
+        }
+    };
+    let l_amp = q88_to_lin(gain_l);
+    let r_amp = q88_to_lin(gain_r);
+    let total = l_amp.hypot(r_amp);
+    if total <= 1e-5 {
+        return (MIXER_FADER_MIN_DB, 0);
+    }
+    let level_db = (20.0 * total.log10()).clamp(MIXER_FADER_MIN_DB, MIXER_FADER_MAX_DB);
+    let level_rounded = (level_db * 10.0).round() / 10.0;
+    let theta = r_amp.atan2(l_amp);
+    let pan_norm = (theta / FRAC_PI_2).clamp(0.0, 1.0);
+    let pan = (pan_norm * 128.0 - 64.0).round().clamp(-64.0, 64.0) as i8;
+    (level_rounded, pan)
 }
 
 /// Format a fader or master level in dB according to the AudioFuse Control Center specification:
@@ -271,7 +420,45 @@ pub fn format_pan(pan: i8) -> String {
     }
 }
 
-/// Convert raw hardware VU meter value (`0..=127`) to approximate dBFS (`-60.0..=0.0` dBFS).
+// --- Verified 24-bit Left-Aligned VU Telemetry Conversions (Unit 0x11, 152 bytes) ---
+
+/// Convert a hardware 24-bit signed left-aligned linear peak `i32` (from Unit `0x11`) into dBFS (`-60.0..=0.0`).
+pub fn vu_i32_to_dbfs(raw: i32) -> f32 {
+    let sample24 = (raw >> 8).unsigned_abs() as f32;
+    let linear = (sample24 / 8_388_607.0).clamp(0.0, 1.0);
+    if linear <= 1e-3 {
+        -60.0
+    } else {
+        (20.0 * linear.log10()).clamp(-60.0, 0.0)
+    }
+}
+
+/// Convert a hardware 24-bit signed left-aligned linear peak `i32` (from Unit `0x11`) into the `0..=127` VU scale
+/// matching [`vu_to_dbfs`] (`0 = -60.0 dBFS`, `127 = 0.0 dBFS`).
+pub fn vu_i32_to_u8(raw: i32) -> u8 {
+    let dbfs = vu_i32_to_dbfs(raw);
+    if dbfs <= -59.9 {
+        0
+    } else {
+        (((dbfs + 60.0) / 60.0) * 127.0)
+            .round()
+            .clamp(0.0, 127.0) as u8
+    }
+}
+
+/// Convert a `0..=127` VU meter level into a hardware-format 24-bit left-aligned peak `i32` (for simulator).
+pub fn vu_u8_to_i32(vu: u8) -> i32 {
+    let clamped = vu.min(127);
+    if clamped == 0 {
+        return 0;
+    }
+    let dbfs = vu_to_dbfs(clamped);
+    let linear = 10.0_f32.powf(dbfs / 20.0).clamp(0.0, 1.0);
+    let sample24 = (linear * 8_388_607.0).round() as i32;
+    sample24 << 8
+}
+
+/// Convert a normalized VU meter value (`0..=127`) to dBFS (`-60.0..=0.0` dBFS).
 pub fn vu_to_dbfs(vu: u8) -> f32 {
     let clamped = vu.min(127);
     if clamped == 0 {
@@ -284,7 +471,7 @@ pub fn vu_to_dbfs(vu: u8) -> f32 {
 
 // --- Enumerated Hardware Parameters ---
 
-/// `Device Mode` (`param_id = 0x05`): USB interface vs. standalone 8-channel ADAT expander.
+/// `Device Mode` (`param_id = 0x66`): USB interface vs. standalone 8-channel ADAT expander.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u16)]
 pub enum DeviceMode {
@@ -315,7 +502,12 @@ impl fmt::Display for DeviceMode {
     }
 }
 
-/// `Clock Source` (`param.xml` enum `0..2`, UAC2 Entity `40` pins `1..3`).
+/// `Clock Source` (UAC2 Clock Selector Entity `40` / `0x28`).
+///
+/// Verified USB descriptor & ALSA pin mapping:
+/// - Pin `1` -> Entity `41` (`0x29`): `Internal Clock`
+/// - Pin `2` -> Entity `43` (`0x2B`): `WORD Clock`
+/// - Pin `3` -> Entity `44` (`0x2C`): `ADAT Clock`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u8)]
 pub enum ClockSource {
@@ -335,30 +527,39 @@ impl ClockSource {
     }
 
     /// Convert to UAC2 Clock Selector Entity `40` (`0x28`) 1-based pin index:
-    /// `1` = Internal (`0x29`), `2` = ADAT (`0x2B`), `3` = Word Clock (`0x2C`).
+    /// `1` = Internal (`0x29`), `2` = WORD Clock (`0x2B`), `3` = ADAT Clock (`0x2C`).
     pub fn to_uac2_pin(&self) -> u8 {
         match self {
             Self::Internal => 1,
-            Self::Adat => 2,
-            Self::WordClock => 3,
+            Self::WordClock => 2,
+            Self::Adat => 3,
         }
     }
 
     /// Decode from UAC2 Clock Selector Entity `40` (`0x28`) 1-based pin index.
     pub fn from_uac2_pin(pin: u8) -> Self {
         match pin {
-            2 => Self::Adat,
-            3 => Self::WordClock,
+            2 => Self::WordClock,
+            3 => Self::Adat,
             _ => Self::Internal,
         }
     }
 
-    /// Return the corresponding UAC2 Clock Source Entity ID (`41`, `43`, or `44`).
+    /// Convert to ALSA `amixer -c A8Pre cset numid=4 <idx>` enum value (`0 = Internal, 1 = WORD, 2 = ADAT`).
+    pub fn to_alsa_enum_index(&self) -> u8 {
+        match self {
+            Self::Internal => 0,
+            Self::WordClock => 1,
+            Self::Adat => 2,
+        }
+    }
+
+    /// Return the corresponding UAC2 Clock Source Entity ID (`41` Internal, `43` WORD, `44` ADAT).
     pub fn uac2_clock_entity(&self) -> u8 {
         match self {
             Self::Internal => UAC2_ENTITY_CLOCK_INTERNAL,
-            Self::Adat => UAC2_ENTITY_CLOCK_ADAT,
             Self::WordClock => UAC2_ENTITY_CLOCK_WORD,
+            Self::Adat => UAC2_ENTITY_CLOCK_ADAT,
         }
     }
 
@@ -453,7 +654,7 @@ impl fmt::Display for SampleRate {
     }
 }
 
-/// `Wordclock Impedance` (`param_id = 0x08`): `0` = `75 Ohms (On)`, `1` = `HiZ (Off)`.
+/// `Wordclock Impedance` (`param_id = 0x70`): `0` = `75 Ohms (On)`, `1` = `HiZ (Off)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u16)]
 pub enum WordclockImpedance {
@@ -484,7 +685,7 @@ impl fmt::Display for WordclockImpedance {
     }
 }
 
-/// `SMUX Mode` (`param_id = 0x0a`): `0` = `Normal`, `1` = `Double Speed`.
+/// `SMUX Mode` (`param_id = 0x83`, `ch = 0x00`): `0` = `Normal`, `1` = `Double Speed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u16)]
 pub enum SmuxMode {
@@ -515,8 +716,9 @@ impl fmt::Display for SmuxMode {
     }
 }
 
-/// Analog Input Connector / Impedance Mode (`Input N Type`, `param_id = 0x10`).
-/// Channels 1 & 2 support `Inst` (`Hi-Z`, value `3`); Channels 3..8 support `0..2`.
+/// Analog Input Connector / Impedance Mode.
+/// On physical hardware, Mic vs. Line is sensed via `param_id::INPUT_JACK_SENSE` (`0x15` read-only);
+/// Channels 1 & 2 support software-switchable Hi-Z `Inst` via `param_id::INPUT_INST` (`0x0d`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u16)]
 pub enum InputType {
@@ -554,7 +756,7 @@ impl fmt::Display for InputType {
     }
 }
 
-/// `Input N PAD Line` (`0`: `Off`, `1`: `-20dB`).
+/// `Input N PAD Line` (`param_id = 0x0c`): `0` = `Off`, `1` = `-20dB`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u16)]
 pub enum LinePad {
@@ -585,7 +787,7 @@ impl fmt::Display for LinePad {
     }
 }
 
-/// `Input N PAD Mic` (`0`: `OFF`, `1`: `PAD (-20 dB)`, `2`: `BOOST`).
+/// `Input N PAD Mic` (`param_id = 0x04`): `0` = `OFF`, `1` = `PAD (-20dB)`, `2` = `BOOST`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u16)]
 pub enum MicPadBoost {
@@ -665,7 +867,7 @@ impl MixerBank {
     }
 }
 
-/// `Speakers Source` (`param_id = 0x38`): `0` = `Main 1-2`, `1` = `Cue Mix`.
+/// `Speakers Source` (`param_id = 0x0f`, `ch = 0xff`): `0` = `Main 1-2`, `1` = `Cue Mix`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u16)]
 pub enum SpeakersSource {
@@ -696,7 +898,7 @@ impl fmt::Display for SpeakersSource {
     }
 }
 
-/// `Phones Source` (`param_id = 0x40`): `0` = `Main 1-2`, `1` = `Cue Mix`, `2` = `Follow Spkrs`.
+/// `Phones Source` (`param_id = 0x10`, `ch = 0xff`): `0` = `Main 1-2`, `1` = `Cue Mix`, `2` = `Follow Spkrs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u16)]
 pub enum PhonesSource {
@@ -730,7 +932,9 @@ impl fmt::Display for PhonesSource {
     }
 }
 
-/// `Analog 1-2..7-8 Source` (`param_id = 0x48`, `idx = 0..3`).
+/// `Analog 1-2..7-8 Source` (`param_id = 0x7a`, `ch = 0..3`).
+/// Hardware wire encoding is a 1-hot bitmask: `0x0001 = CueMix`, `0x0002 = UsbPair`,
+/// `0x0004 = AnalogInPair`, `0x0008 = AdatInPair`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u16)]
 pub enum AnalogOutSource {
@@ -749,12 +953,34 @@ impl AnalogOutSource {
         AnalogOutSource::AdatInPair,
     ];
 
+    /// Decode from enum index (`0..=3`, used in simulator preset format).
     pub fn from_raw(v: u16) -> Self {
         match v {
             0 => Self::CueMix,
             1 => Self::UsbPair,
             2 => Self::AnalogInPair,
             3 => Self::AdatInPair,
+            _ => Self::UsbPair,
+        }
+    }
+
+    /// Encode to verified hardware 1-hot bitmask (`0x0001`, `0x0002`, `0x0004`, `0x0008`).
+    pub fn to_wire_mask(&self) -> u16 {
+        match self {
+            Self::CueMix => 0x0001,
+            Self::UsbPair => 0x0002,
+            Self::AnalogInPair => 0x0004,
+            Self::AdatInPair => 0x0008,
+        }
+    }
+
+    /// Decode from verified hardware 1-hot bitmask (`0x0001`, `0x0002`, `0x0004`, `0x0008`).
+    pub fn from_wire_mask(mask: u16) -> Self {
+        match mask {
+            0x0001 => Self::CueMix,
+            0x0002 => Self::UsbPair,
+            0x0004 => Self::AnalogInPair,
+            0x0008 => Self::AdatInPair,
             _ => Self::UsbPair,
         }
     }
@@ -771,7 +997,9 @@ impl AnalogOutSource {
     }
 }
 
-/// `ADAT 1-2..7-8 Source` (`param_id = 0x49`, `idx = 0..3`).
+/// `ADAT 1-2..7-8 Source` (`param_id = 0x7e`, `ch = 0..3`).
+/// Hardware wire encoding is a 1-hot bitmask: `0x0001 = CueMix`, `0x0002 = UsbPair (9-16)`,
+/// `0x0004 = AnalogInPair`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u16)]
 pub enum AdatOutSource {
@@ -788,11 +1016,31 @@ impl AdatOutSource {
         AdatOutSource::AnalogInPair,
     ];
 
+    /// Decode from enum index (`0..=2`, used in simulator preset format).
     pub fn from_raw(v: u16) -> Self {
         match v {
             0 => Self::CueMix,
             1 => Self::UsbPair,
             2 => Self::AnalogInPair,
+            _ => Self::UsbPair,
+        }
+    }
+
+    /// Encode to verified hardware 1-hot bitmask (`0x0001`, `0x0002`, `0x0004`).
+    pub fn to_wire_mask(&self) -> u16 {
+        match self {
+            Self::CueMix => 0x0001,
+            Self::UsbPair => 0x0002,
+            Self::AnalogInPair => 0x0004,
+        }
+    }
+
+    /// Decode from verified hardware 1-hot bitmask (`0x0001`, `0x0002`, `0x0004`).
+    pub fn from_wire_mask(mask: u16) -> Self {
+        match mask {
+            0x0001 => Self::CueMix,
+            0x0002 => Self::UsbPair,
+            0x0004 => Self::AnalogInPair,
             _ => Self::UsbPair,
         }
     }
@@ -810,7 +1058,8 @@ impl AdatOutSource {
     }
 }
 
-/// `Loopback Source` (`param_id = 0x4a`, `idx = 0`): `0` = `Disabled`, `1` = `Cue Mix`, `2` = `USB 17-18`.
+/// `Loopback Source` (`param_id = 0x82`, `ch = 0xff`):
+/// `0x0000` = `Disabled`, `0x0001` = `Cue Mix`, `0x0002` = `USB 17-18`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u16)]
 pub enum LoopbackSource {
@@ -832,8 +1081,18 @@ impl LoopbackSource {
             0 => Self::Disabled,
             1 => Self::CueMix,
             2 => Self::Usb17_18,
-            _ => Self::CueMix,
+            _ => Self::Disabled,
         }
+    }
+
+    /// Encode to verified hardware bitmask (`0x0000`, `0x0001`, `0x0002`).
+    pub fn to_wire_mask(&self) -> u16 {
+        *self as u16
+    }
+
+    /// Decode from verified hardware bitmask (`0x0000`, `0x0001`, `0x0002`).
+    pub fn from_wire_mask(mask: u16) -> Self {
+        Self::from_raw(mask)
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -864,7 +1123,20 @@ pub fn encode_device_string_16(s: &str) -> [u8; MAX_DEVICE_STRING_LEN] {
     buf
 }
 
-/// Decode a 16-byte zero-padded buffer into a clean Rust `String`.
+/// Truncate or space-pad an ASCII string to 16 bytes for hardware `Device Name` (`param_id = 0x68`).
+pub fn encode_device_name_16(s: &str) -> [u8; MAX_DEVICE_STRING_LEN] {
+    let mut buf = [b' '; MAX_DEVICE_STRING_LEN];
+    for (i, b) in s.bytes().take(MAX_DEVICE_STRING_LEN).enumerate() {
+        buf[i] = if b.is_ascii() && !b.is_ascii_control() {
+            b
+        } else {
+            b'_'
+        };
+    }
+    buf
+}
+
+/// Decode a 16-byte zero- or space-padded buffer into a clean Rust `String`.
 pub fn decode_device_string_16(buf: &[u8]) -> String {
     let len = buf
         .iter()

@@ -317,6 +317,418 @@ impl AudioFuseState {
         }
     }
 
+    /// Encode this state into the verified 266-byte (`0x010a`) Unit `0x0d` hardware state snapshot.
+    pub fn encode_afex_state_266(&self) -> [u8; AFEX_STATE_SIZE] {
+        let mut buf = [0u8; AFEX_STATE_SIZE];
+        buf[0..6].copy_from_slice(&AFEX_STATE_MAGIC);
+
+        let write_u16 = |b: &mut [u8], pid: u8, val: u16| {
+            let off = (pid as usize) * 2;
+            b[off..off + 2].copy_from_slice(&val.to_le_bytes());
+        };
+        let write_i16 = |b: &mut [u8], pid: u8, val: i16| {
+            let off = (pid as usize) * 2;
+            b[off..off + 2].copy_from_slice(&val.to_le_bytes());
+        };
+
+        let mut pad_line_mask = 0u16;
+        let mut inst_mask = 0u16;
+        let mut phase_mask = 0u16;
+        let mut phantom_mask = 0u16;
+        for i in 0..8 {
+            let inp = &self.inputs[i];
+            let pad_mic_off = (param_id::INPUT_PAD_MIC as usize) * 2 + i * 2;
+            buf[pad_mic_off..pad_mic_off + 2].copy_from_slice(&(inp.pad_mic as u16).to_le_bytes());
+            if inp.pad_line == LinePad::Pad20dB {
+                pad_line_mask |= 1 << i;
+            }
+            if i < 2 && inp.inst_hi_z {
+                inst_mask |= 1 << i;
+            }
+            if inp.phase_invert {
+                phase_mask |= 1 << i;
+            }
+            if inp.phantom_48v {
+                phantom_mask |= 1 << i;
+            }
+            let sense: u16 = match inp.input_type {
+                InputType::Mic => 1,
+                InputType::Line | InputType::Inst => 2,
+                InputType::ComboAuto => 0,
+            };
+            let sense_off = (param_id::INPUT_JACK_SENSE as usize) * 2 + i * 2;
+            buf[sense_off..sense_off + 2].copy_from_slice(&sense.to_le_bytes());
+        }
+
+        write_u16(&mut buf, param_id::INPUT_PAD_LINE, pad_line_mask);
+        write_u16(&mut buf, param_id::INPUT_INST, inst_mask);
+        write_u16(&mut buf, param_id::INPUT_PHASE_INVERT, phase_mask);
+        write_u16(
+            &mut buf,
+            param_id::SPEAKERS_SOURCE,
+            self.monitor.speakers_source as u16,
+        );
+        write_u16(
+            &mut buf,
+            param_id::PHONES_SOURCE,
+            self.monitor.phones_source as u16,
+        );
+        write_u16(
+            &mut buf,
+            param_id::SPEAKERS_MONO,
+            u16::from(self.monitor.speakers_mono),
+        );
+        write_u16(
+            &mut buf,
+            param_id::PHONES_MONO,
+            u16::from(self.monitor.phones_mono),
+        );
+        write_u16(&mut buf, param_id::INPUT_PHANTOM, phantom_mask);
+
+        let mut mute_aa = 0u16;
+        let mut mute_usb = 0u16;
+        let mut solo_aa = 0u16;
+        let mut solo_usb = 0u16;
+        let mut show_aa = 0u16;
+        let mut show_usb = 0u16;
+        for (i, ch) in self.mixer_channels.iter().take(24).enumerate() {
+            let (gl, gr) = encode_mixer_channel_gains_q88(ch.level_db, ch.pan);
+            let off_l = (param_id::MIXER_CH_GAIN_L as usize) * 2 + i * 2;
+            let off_r = (param_id::MIXER_CH_GAIN_R as usize) * 2 + i * 2;
+            buf[off_l..off_l + 2].copy_from_slice(&gl.to_le_bytes());
+            buf[off_r..off_r + 2].copy_from_slice(&gr.to_le_bytes());
+            if i < 16 {
+                if ch.mute {
+                    mute_aa |= 1 << i;
+                }
+                if ch.solo {
+                    solo_aa |= 1 << i;
+                }
+                if ch.show {
+                    show_aa |= 1 << i;
+                }
+            } else {
+                let u = i - 16;
+                if ch.mute {
+                    mute_usb |= 1 << u;
+                }
+                if ch.solo {
+                    solo_usb |= 1 << u;
+                }
+                if ch.show {
+                    show_usb |= 1 << u;
+                }
+            }
+        }
+        write_u16(&mut buf, param_id::MIXER_MUTE_ANALOG_ADAT, mute_aa);
+        write_u16(&mut buf, param_id::MIXER_MUTE_USB, mute_usb);
+        write_u16(&mut buf, param_id::MIXER_SOLO_ANALOG_ADAT, solo_aa);
+        write_u16(&mut buf, param_id::MIXER_SOLO_USB, solo_usb);
+        write_i16(
+            &mut buf,
+            param_id::MIXER_OUT_LEVEL,
+            encode_master_level_q88(self.monitor.mixer_output_level_db),
+        );
+        write_u16(&mut buf, param_id::MIXER_SHOW_USB, show_usb);
+        write_u16(&mut buf, param_id::MIXER_SHOW_ANALOG_ADAT, show_aa);
+
+        let mut stereo_mask = 0u16;
+        for bank in 0..3 {
+            for pair in 0..4 {
+                if self.stereo_links[bank].get_pair(pair) {
+                    stereo_mask |= 1 << (bank * 4 + pair);
+                }
+            }
+        }
+        write_u16(&mut buf, param_id::MIXER_STEREO_SHOW, stereo_mask);
+
+        write_u16(
+            &mut buf,
+            param_id::DEVICE_MODE,
+            self.config.device_mode as u16,
+        );
+        let name_off = (param_id::DEVICE_NAME as usize) * 2;
+        buf[name_off..name_off + MAX_DEVICE_STRING_LEN]
+            .copy_from_slice(&encode_device_name_16(&self.config.device_name));
+
+        write_u16(
+            &mut buf,
+            param_id::WORDCLOCK_IMPEDANCE,
+            self.config.wordclock_impedance as u16,
+        );
+        write_u16(
+            &mut buf,
+            param_id::WORDCLOCK_THRU,
+            u16::from(self.config.wordclock_thru),
+        );
+        let ser_off = (param_id::SERIAL_NUMBER as usize) * 2;
+        buf[ser_off..ser_off + MAX_DEVICE_STRING_LEN]
+            .copy_from_slice(&encode_device_string_16(&self.config.serial_number));
+
+        for pair in 0..4 {
+            let ao_off = (param_id::ANALOG_OUT_SOURCE as usize) * 2 + pair * 2;
+            buf[ao_off..ao_off + 2].copy_from_slice(
+                &self.routing.analog_out_sources[pair]
+                    .to_wire_mask()
+                    .to_le_bytes(),
+            );
+            let ad_off = (param_id::ADAT_OUT_SOURCE as usize) * 2 + pair * 2;
+            buf[ad_off..ad_off + 2].copy_from_slice(
+                &self.routing.adat_out_sources[pair]
+                    .to_wire_mask()
+                    .to_le_bytes(),
+            );
+        }
+        write_u16(
+            &mut buf,
+            param_id::LOOPBACK_SOURCE,
+            self.routing.loopback_source.to_wire_mask(),
+        );
+        write_u16(&mut buf, param_id::SMUX_MODE, self.config.smux_mode as u16);
+        write_u16(&mut buf, param_id::ADAT_ON, u16::from(self.config.adat_on));
+
+        buf
+    }
+
+    /// Apply a verified 266-byte (`0x010a`) Unit `0x0d` hardware state snapshot to this state.
+    pub fn apply_afex_state_266(&mut self, buf: &[u8; AFEX_STATE_SIZE]) -> Result<(), String> {
+        if buf[0..6] != AFEX_STATE_MAGIC {
+            return Err(format!(
+                "Invalid AFEX Unit 0x0d header: {:02x?}",
+                &buf[0..6]
+            ));
+        }
+        let read_u16 = |pid: u8| -> u16 {
+            let off = (pid as usize) * 2;
+            u16::from_le_bytes([buf[off], buf[off + 1]])
+        };
+        let read_i16 = |pid: u8| -> i16 {
+            let off = (pid as usize) * 2;
+            i16::from_le_bytes([buf[off], buf[off + 1]])
+        };
+
+        let pad_line_mask = read_u16(param_id::INPUT_PAD_LINE);
+        let inst_mask = read_u16(param_id::INPUT_INST);
+        let phase_mask = read_u16(param_id::INPUT_PHASE_INVERT);
+        let phantom_mask = read_u16(param_id::INPUT_PHANTOM);
+
+        for i in 0..8 {
+            let inp = &mut self.inputs[i];
+            let pad_mic_off = (param_id::INPUT_PAD_MIC as usize) * 2 + i * 2;
+            let pad_mic_raw = u16::from_le_bytes([buf[pad_mic_off], buf[pad_mic_off + 1]]);
+            inp.pad_mic = MicPadBoost::from_raw(pad_mic_raw);
+            inp.pad_line = if ((pad_line_mask >> i) & 1) != 0 {
+                LinePad::Pad20dB
+            } else {
+                LinePad::Off
+            };
+            inp.inst_hi_z = i < 2 && ((inst_mask >> i) & 1) != 0;
+            inp.phase_invert = ((phase_mask >> i) & 1) != 0;
+            inp.phantom_48v = ((phantom_mask >> i) & 1) != 0;
+
+            let sense_off = (param_id::INPUT_JACK_SENSE as usize) * 2 + i * 2;
+            let sense = u16::from_le_bytes([buf[sense_off], buf[sense_off + 1]]);
+            match sense {
+                1 => {
+                    inp.mic_active = true;
+                    inp.jack_active = false;
+                    inp.input_type = InputType::Mic;
+                }
+                2 => {
+                    inp.mic_active = false;
+                    inp.jack_active = true;
+                    inp.input_type = if inp.inst_hi_z {
+                        InputType::Inst
+                    } else {
+                        InputType::Line
+                    };
+                }
+                _ => {
+                    if inp.inst_hi_z {
+                        inp.mic_active = false;
+                        inp.jack_active = true;
+                        inp.input_type = InputType::Inst;
+                    } else {
+                        inp.mic_active = false;
+                        inp.jack_active = false;
+                        inp.input_type = InputType::ComboAuto;
+                    }
+                }
+            }
+        }
+
+        self.monitor.speakers_source =
+            SpeakersSource::from_raw(read_u16(param_id::SPEAKERS_SOURCE));
+        self.monitor.phones_source = PhonesSource::from_raw(read_u16(param_id::PHONES_SOURCE));
+        self.monitor.speakers_mono = read_u16(param_id::SPEAKERS_MONO) != 0;
+        self.monitor.phones_mono = read_u16(param_id::PHONES_MONO) != 0;
+
+        let mute_aa = read_u16(param_id::MIXER_MUTE_ANALOG_ADAT);
+        let mute_usb = read_u16(param_id::MIXER_MUTE_USB);
+        let solo_aa = read_u16(param_id::MIXER_SOLO_ANALOG_ADAT);
+        let solo_usb = read_u16(param_id::MIXER_SOLO_USB);
+        let show_usb = read_u16(param_id::MIXER_SHOW_USB);
+        let show_aa = read_u16(param_id::MIXER_SHOW_ANALOG_ADAT);
+
+        for (i, ch) in self.mixer_channels.iter_mut().take(24).enumerate() {
+            let off_l = (param_id::MIXER_CH_GAIN_L as usize) * 2 + i * 2;
+            let off_r = (param_id::MIXER_CH_GAIN_R as usize) * 2 + i * 2;
+            let gl = i16::from_le_bytes([buf[off_l], buf[off_l + 1]]);
+            let gr = i16::from_le_bytes([buf[off_r], buf[off_r + 1]]);
+            let (lvl, pan) = decode_mixer_channel_gains_q88(gl, gr);
+            ch.level_db = lvl;
+            ch.pan = pan;
+            if i < 16 {
+                ch.mute = ((mute_aa >> i) & 1) != 0;
+                ch.solo = ((solo_aa >> i) & 1) != 0;
+                ch.show = ((show_aa >> i) & 1) != 0;
+            } else {
+                let u = i - 16;
+                ch.mute = ((mute_usb >> u) & 1) != 0;
+                ch.solo = ((solo_usb >> u) & 1) != 0;
+                ch.show = ((show_usb >> u) & 1) != 0;
+            }
+        }
+
+        self.monitor.mixer_output_level_db =
+            decode_master_level_q88(read_i16(param_id::MIXER_OUT_LEVEL));
+
+        let stereo_mask = read_u16(param_id::MIXER_STEREO_SHOW);
+        for bank in 0..3 {
+            for pair in 0..4 {
+                self.stereo_links[bank].set_pair(pair, ((stereo_mask >> (bank * 4 + pair)) & 1) != 0);
+            }
+        }
+
+        self.config.device_mode = DeviceMode::from_raw(read_u16(param_id::DEVICE_MODE));
+        let name_off = (param_id::DEVICE_NAME as usize) * 2;
+        let name = decode_device_string_16(&buf[name_off..name_off + MAX_DEVICE_STRING_LEN]);
+        if !name.is_empty() {
+            self.config.device_name = name;
+        }
+        self.config.wordclock_impedance =
+            WordclockImpedance::from_raw(read_u16(param_id::WORDCLOCK_IMPEDANCE));
+        self.config.wordclock_thru = read_u16(param_id::WORDCLOCK_THRU) != 0;
+        let ser_off = (param_id::SERIAL_NUMBER as usize) * 2;
+        let ser = decode_device_string_16(&buf[ser_off..ser_off + MAX_DEVICE_STRING_LEN]);
+        if !ser.is_empty() {
+            self.config.serial_number = ser;
+        }
+
+        for pair in 0..4 {
+            let ao_off = (param_id::ANALOG_OUT_SOURCE as usize) * 2 + pair * 2;
+            let ao_mask = u16::from_le_bytes([buf[ao_off], buf[ao_off + 1]]);
+            self.routing.analog_out_sources[pair] = AnalogOutSource::from_wire_mask(ao_mask);
+
+            let ad_off = (param_id::ADAT_OUT_SOURCE as usize) * 2 + pair * 2;
+            let ad_mask = u16::from_le_bytes([buf[ad_off], buf[ad_off + 1]]);
+            self.routing.adat_out_sources[pair] = AdatOutSource::from_wire_mask(ad_mask);
+        }
+        self.routing.loopback_source =
+            LoopbackSource::from_wire_mask(read_u16(param_id::LOOPBACK_SOURCE));
+        self.config.smux_mode = SmuxMode::from_raw(read_u16(param_id::SMUX_MODE));
+        self.config.adat_on = read_u16(param_id::ADAT_ON) != 0;
+
+        Ok(())
+    }
+
+    /// Encode current VU levels into the verified 152-byte (`38 × i32` LE) Unit `0x11` VU payload.
+    pub fn encode_afex_vu_152(&self) -> [u8; AFEX_VU_SIZE] {
+        let mut slots = [0i32; AFEX_VU_CHANNELS];
+        for i in 0..8 {
+            slots[i] = vu_u8_to_i32(self.inputs[i].vu);
+            slots[8 + i] = vu_u8_to_i32(self.adat_in_vu[i]);
+            slots[16 + i] = vu_u8_to_i32(self.usb_in_vu[i]);
+            slots[24 + i] = vu_u8_to_i32(self.routing.adat_out_vu[i]);
+        }
+        slots[32] = vu_u8_to_i32(self.routing.loopback_vu_l);
+        slots[33] = vu_u8_to_i32(self.routing.loopback_vu_r);
+        slots[34] = vu_u8_to_i32(self.monitor.mixer_main_vu_l);
+        slots[35] = vu_u8_to_i32(self.monitor.mixer_main_vu_r);
+        slots[36] = vu_u8_to_i32(self.monitor.mixer_main_vu_l);
+        slots[37] = vu_u8_to_i32(self.monitor.mixer_main_vu_r);
+
+        let mut buf = [0u8; AFEX_VU_SIZE];
+        for (i, val) in slots.iter().enumerate() {
+            buf[i * 4..i * 4 + 4].copy_from_slice(&val.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Decode a verified 152-byte (`38 × i32` LE) Unit `0x11` live VU payload into all input,
+    /// cue mixer, monitor, and routed output VU meters.
+    pub fn apply_afex_vu_152(&mut self, buf: &[u8; AFEX_VU_SIZE]) {
+        let mut vu = [0u8; AFEX_VU_CHANNELS];
+        for i in 0..AFEX_VU_CHANNELS {
+            let raw = i32::from_le_bytes([
+                buf[i * 4],
+                buf[i * 4 + 1],
+                buf[i * 4 + 2],
+                buf[i * 4 + 3],
+            ]);
+            vu[i] = vu_i32_to_u8(raw);
+        }
+
+        for i in 0..8 {
+            self.inputs[i].vu = vu[i];
+            self.adat_in_vu[i] = vu[8 + i];
+            self.usb_in_vu[i] = vu[16 + i];
+        }
+        for (idx, ch) in self.mixer_channels.iter_mut().take(24).enumerate() {
+            ch.vu = vu[idx];
+            ch.peak = vu[idx] >= 126;
+        }
+
+        let cue_l = vu[36];
+        let cue_r = vu[37];
+        self.monitor.mixer_main_vu_l = cue_l;
+        self.monitor.mixer_main_vu_r = cue_r;
+
+        let (spk_l, spk_r) = match self.monitor.speakers_source {
+            SpeakersSource::Main1_2 => (vu[16], vu[17]),
+            SpeakersSource::CueMix => (cue_l, cue_r),
+        };
+        self.monitor.speakers_vu_l = spk_l;
+        self.monitor.speakers_vu_r = spk_r;
+
+        let (ph_l, ph_r) = match self.monitor.phones_source {
+            PhonesSource::Main1_2 => (vu[16], vu[17]),
+            PhonesSource::CueMix => (cue_l, cue_r),
+            PhonesSource::FollowSpeakers => (spk_l, spk_r),
+        };
+        self.monitor.phones_vu_l = ph_l;
+        self.monitor.phones_vu_r = ph_r;
+
+        for pair in 0..4 {
+            let ch_l = pair * 2;
+            let ch_r = ch_l + 1;
+            let (ao_l, ao_r) = match self.routing.analog_out_sources[pair] {
+                AnalogOutSource::CueMix => (cue_l, cue_r),
+                AnalogOutSource::UsbPair => (vu[16 + ch_l], vu[16 + ch_r]),
+                AnalogOutSource::AnalogInPair => (vu[ch_l], vu[ch_r]),
+                AnalogOutSource::AdatInPair => (vu[8 + ch_l], vu[8 + ch_r]),
+            };
+            self.routing.analog_out_vu[ch_l] = ao_l;
+            self.routing.analog_out_vu[ch_r] = ao_r;
+
+            let (ad_l, ad_r) = match self.routing.adat_out_sources[pair] {
+                AdatOutSource::CueMix => (cue_l, cue_r),
+                AdatOutSource::UsbPair => (vu[24 + ch_l], vu[24 + ch_r]),
+                AdatOutSource::AnalogInPair => (vu[ch_l], vu[ch_r]),
+            };
+            self.routing.adat_out_vu[ch_l] = ad_l;
+            self.routing.adat_out_vu[ch_r] = ad_r;
+        }
+
+        let (lb_l, lb_r) = match self.routing.loopback_source {
+            LoopbackSource::Disabled => (0, 0),
+            LoopbackSource::CueMix => (cue_l, cue_r),
+            LoopbackSource::Usb17_18 => (vu[32], vu[33]),
+        };
+        self.routing.loopback_vu_l = lb_l;
+        self.routing.loopback_vu_r = lb_r;
+    }
+
     /// Encode the real-time hardware state and VU meters into the 78-byte (`0x4e`) bulk payload.
     ///
     /// Layout of the 78-byte (`0x4e`) hardware bulk state / VU meter packet:

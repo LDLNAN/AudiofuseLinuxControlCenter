@@ -21,8 +21,9 @@ use crate::theme::{StudioPalette, StudioThemeMode};
 use audiofuse_core::{
     AdatOutSource, AnalogOutSource, AudioFuseController, ClockSource, DeviceMode,
     FirmwareInspection, InputType, LinePad, LoopbackSource, MicPadBoost, MixerBank, PhonesSource,
-    SampleRate, SmuxMode, SpeakersSource, WordclockImpedance, fader_db_to_normalized,
-    fader_normalized_to_db, format_db, format_pan, inspect_af8pre_file, vu_to_dbfs,
+    SampleRate, SmuxMode, SpeakersSource, TelemetryFrame, WordclockImpedance,
+    fader_db_to_normalized, fader_normalized_to_db, format_db, format_pan, inspect_af8pre_file,
+    vu_to_dbfs,
 };
 use egui::{
     Align, Color32, CornerRadius, FontId, Frame, Key, Layout, Margin, RichText, Sense, Stroke, Ui,
@@ -41,7 +42,7 @@ pub struct ControlCenterApp {
     pub inspected_firmware: Option<FirmwareInspection>,
     pub show_firmware_modal: bool,
     pub status_banner: String,
-    meters: std::sync::mpsc::Receiver<Result<[u8; 78], audiofuse_core::TransportError>>,
+    meters: std::sync::mpsc::Receiver<Result<TelemetryFrame, audiofuse_core::TransportError>>,
     pub screenshot: Option<PathBuf>,
     page: usize,
     device_name: String,
@@ -52,7 +53,7 @@ pub struct ControlCenterApp {
 impl ControlCenterApp {
     pub fn new(controller: AudioFuseController, theme_mode: StudioThemeMode) -> Self {
         let device_name = controller.state().config.device_name.clone();
-        let meters = controller.subscribe_meters();
+        let meters = controller.subscribe_telemetry();
         let dfu = match controller.dfu_status() {
             Ok(report) => format!("{} • {}", controller.backend_name(), report.state.as_str()),
             Err(error) => format!("DFU status unavailable: {error}"),
@@ -332,12 +333,17 @@ impl ControlCenterApp {
 
                     ui.separator();
 
-                    // Hardware Presets (0x48 / 0x49) & Firmware / Theme
+                    // Presets & Firmware / Theme
                     ui.vertical(|ui| {
+                        let simulated = self.controller.is_simulated();
                         ui.label(
-                            RichText::new("PRESETS (0x48/0x49) & TOOLS")
-                                .font(FontId::proportional(10.0))
-                                .color(pal.text_muted),
+                            RichText::new(if simulated {
+                                "PRESETS (SIMULATOR SLOTS & JSON) & TOOLS"
+                            } else {
+                                "PRESETS (JSON SESSION) & TOOLS"
+                            })
+                            .font(FontId::proportional(10.0))
+                            .color(pal.text_muted),
                         );
                         ui.horizontal(|ui| {
                             ui.label("Preset file");
@@ -345,33 +351,35 @@ impl ControlCenterApp {
                         });
                         ui.horizontal_wrapped(|ui| {
                             let active_slot = self.controller.state().active_preset_slot;
-                            for slot in 0..8u8 {
-                                let label = format!("P{}", slot + 1);
-                                if studio_toggle_btn(
-                                    ui,
-                                    &label,
-                                    active_slot == slot,
-                                    pal.accent_orange,
-                                    pal,
-                                )
-                                .clicked()
-                                {
-                                    if let Err(error) = self.controller.load_hardware_preset(slot) {
+                            if simulated {
+                                for slot in 0..8u8 {
+                                    let label = format!("P{}", slot + 1);
+                                    if studio_toggle_btn(
+                                        ui,
+                                        &label,
+                                        active_slot == slot,
+                                        pal.accent_orange,
+                                        pal,
+                                    )
+                                    .clicked()
+                                    {
+                                        if let Err(error) = self.controller.load_hardware_preset(slot) {
+                                            self.status_banner = error.to_string();
+                                            return;
+                                        }
+                                        self.status_banner =
+                                            format!("LOADED SIMULATOR PRESET SLOT {}", slot + 1);
+                                    }
+                                }
+                                if studio_action_btn(ui, "SAVE SLOT", pal).clicked() {
+                                    let slot = self.controller.state().active_preset_slot;
+                                    if let Err(error) = self.controller.save_hardware_preset(slot) {
                                         self.status_banner = error.to_string();
                                         return;
                                     }
                                     self.status_banner =
-                                        format!("LOADED HW PRESET SLOT {} (0x48)", slot + 1);
+                                        format!("SAVED SIMULATOR PRESET SLOT {}", slot + 1);
                                 }
-                            }
-                            if studio_action_btn(ui, "SAVE HW", pal).clicked() {
-                                let slot = self.controller.state().active_preset_slot;
-                                if let Err(error) = self.controller.save_hardware_preset(slot) {
-                                    self.status_banner = error.to_string();
-                                    return;
-                                }
-                                self.status_banner =
-                                    format!("SAVED HW PRESET SLOT {} (0x49)", slot + 1);
                             }
                             if studio_action_btn(ui, "EXPORT JSON", pal).clicked() {
                                 match self.controller.export_preset_file(
@@ -1048,77 +1056,82 @@ impl ControlCenterApp {
                     ui.add_space(3.0);
 
                     let mon = self.controller.state().monitor.clone();
+                    let simulated = self.controller.is_simulated();
 
-                    // Direct / Computer USB Balance
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("DIRECT / USB MIX")
-                                .font(FontId::monospace(10.0))
-                                .color(pal.text_muted),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // Direct / Computer USB Balance (simulator-only; not a hardware register on 8Pre)
+                    if simulated {
+                        ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(format!(
-                                    "{:.0}% CUE / {:.0}% USB",
-                                    (1.0 - mon.direct_computer_mix) * 100.0,
-                                    mon.direct_computer_mix * 100.0
-                                ))
-                                .font(FontId::monospace(10.0))
-                                .color(pal.text_secondary),
+                                RichText::new("DIRECT / USB MIX")
+                                    .font(FontId::monospace(10.0))
+                                    .color(pal.text_muted),
                             );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{:.0}% CUE / {:.0}% USB",
+                                        (1.0 - mon.direct_computer_mix) * 100.0,
+                                        mon.direct_computer_mix * 100.0
+                                    ))
+                                    .font(FontId::monospace(10.0))
+                                    .color(pal.text_secondary),
+                                );
+                            });
                         });
-                    });
-                    let mut mix_val = mon.direct_computer_mix;
-                    if ui
-                        .add(egui::Slider::new(&mut mix_val, 0.0..=1.0).show_value(false))
-                        .changed()
-                    {
-                        if let Err(error) = self.controller.set_direct_computer_mix(mix_val) {
-                            self.status_banner = error.to_string();
-                            return;
+                        let mut mix_val = mon.direct_computer_mix;
+                        if ui
+                            .add(egui::Slider::new(&mut mix_val, 0.0..=1.0).show_value(false))
+                            .changed()
+                        {
+                            if let Err(error) = self.controller.set_direct_computer_mix(mix_val) {
+                                self.status_banner = error.to_string();
+                                return;
+                            }
                         }
                     }
 
-                    // Master Cue Level (-61.0 .. 0.0 dB) + Mute / Solo
+                    // Master Cue Level (-61.0 .. 0.0 dB, param_id 0x55) + simulator-only Mute / Solo
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new("CUE MASTER LEVEL")
+                            RichText::new("CUE MASTER LEVEL (0x55)")
                                 .font(FontId::monospace(10.0))
                                 .color(pal.text_muted),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if studio_toggle_btn(
-                                ui,
-                                "SOLO",
-                                mon.mixer_output_solo,
-                                pal.warn_amber,
-                                pal,
-                            )
-                            .clicked()
-                            {
-                                if let Err(error) = self
-                                    .controller
-                                    .set_mixer_output_solo(!mon.mixer_output_solo)
+                            if simulated {
+                                if studio_toggle_btn(
+                                    ui,
+                                    "SOLO",
+                                    mon.mixer_output_solo,
+                                    pal.warn_amber,
+                                    pal,
+                                )
+                                .clicked()
                                 {
-                                    self.status_banner = error.to_string();
-                                    return;
+                                    if let Err(error) = self
+                                        .controller
+                                        .set_mixer_output_solo(!mon.mixer_output_solo)
+                                    {
+                                        self.status_banner = error.to_string();
+                                        return;
+                                    }
                                 }
-                            }
-                            if studio_toggle_btn(
-                                ui,
-                                "MUTE",
-                                mon.mixer_output_mute,
-                                pal.alert_red,
-                                pal,
-                            )
-                            .clicked()
-                            {
-                                if let Err(error) = self
-                                    .controller
-                                    .set_mixer_output_mute(!mon.mixer_output_mute)
+                                if studio_toggle_btn(
+                                    ui,
+                                    "MUTE",
+                                    mon.mixer_output_mute,
+                                    pal.alert_red,
+                                    pal,
+                                )
+                                .clicked()
                                 {
-                                    self.status_banner = error.to_string();
-                                    return;
+                                    if let Err(error) = self
+                                        .controller
+                                        .set_mixer_output_mute(!mon.mixer_output_mute)
+                                    {
+                                        self.status_banner = error.to_string();
+                                        return;
+                                    }
                                 }
                             }
                             ui.label(
@@ -1251,7 +1264,7 @@ impl ControlCenterApp {
 
                     // Analog Out 1-2 .. 7-8
                     ui.label(
-                        RichText::new("ANALOG LINE OUTPUTS 1-8 (0x48)")
+                        RichText::new("ANALOG LINE OUTPUTS 1-8 (0x7a)")
                             .font(FontId::monospace(10.0))
                             .color(pal.text_muted),
                     );
@@ -1294,7 +1307,7 @@ impl ControlCenterApp {
 
                     // ADAT Out 1-2 .. 7-8
                     ui.label(
-                        RichText::new("ADAT OPTICAL OUTPUTS 1-8 (0x49)")
+                        RichText::new("ADAT OPTICAL OUTPUTS 1-8 (0x7e)")
                             .font(FontId::monospace(10.0))
                             .color(pal.text_muted),
                     );
@@ -1442,13 +1455,23 @@ impl eframe::App for ControlCenterApp {
 
         self.handle_keyboard_shortcuts(ctx);
 
-        if let Ok(update) = self.meters.try_recv() {
+        while let Ok(update) = self.meters.try_recv() {
             match update {
-                Ok(packet) => self.controller.state_mut().apply_meter_bytes(&packet),
+                Ok(frame) => {
+                    if let Some(state_266) = frame.state_266 {
+                        if let Err(e) = self.controller.state_mut().apply_afex_state_266(&state_266)
+                        {
+                            self.status_banner = format!("State decode error: {e}");
+                        }
+                    }
+                    self.controller
+                        .state_mut()
+                        .apply_afex_vu_152(&frame.vu_152);
+                }
                 Err(e) => self.status_banner = format!("Meters stale: {e}"),
             }
         }
-        ctx.request_repaint_after(Duration::from_millis(25));
+        ctx.request_repaint_after(Duration::from_millis(30));
         // Bottom Studio Telemetry Status Bar
         egui::TopBottomPanel::bottom("studio_status_bar")
             .frame(

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run while playback and capture are active. All device probes are read-only.
+# Run while playback and capture are active on AudioFuse 8Pre (1c75:af0e).
+# Verifies real native hardware read & live VU meter coexistence alongside snd-usb-audio / PipeWire.
 set -euo pipefail
 cli=${AUDIOFUSE_CLI:-target/release/audiofuse-cli}
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/audiofuse-coexistence.XXXXXX")
@@ -22,11 +23,22 @@ snapshot() {
     test "$found" = 1
 }
 snapshot "$scratch/before"
-for action in status clock dfu refusal; do
+for action in status clock inputs mixer routing prefs meters dfu; do
     case $action in
-        dfu) if "$cli" firmware inspect; then echo "Expected live DFU refusal" >&2; exit 1; fi ;;
-        refusal) if "$cli" meters; then echo "Expected native telemetry refusal" >&2; exit 1; fi ;;
-        *) "$cli" "$action" ;;
+        dfu)
+            if "$cli" firmware inspect >/dev/null 2>&1; then
+                echo "Expected live DFU refusal" >&2
+                exit 1
+            fi
+            ;;
+        meters)
+            "$cli" --json meters --count 2 --interval-ms 50 > "$scratch/meters.json"
+            grep -q '"payload_size_bytes": 152' "$scratch/meters.json"
+            grep -q '"vu_unit_id": "0x11"' "$scratch/meters.json"
+            ;;
+        *)
+            "$cli" --json "$action" > "$scratch/$action.json"
+            ;;
     esac
     snapshot "$scratch/$action"
     diff -ru "$scratch/before" "$scratch/$action"

@@ -192,11 +192,19 @@ enum Commands {
         smux: Option<String>,
     },
 
-    /// Poll and display the 78-byte (0x4e) hardware bulk state and real-time VU meters
+    /// Poll and display the verified 152-byte (Unit 0x11) real-time hardware VU meters
     Meters {
-        /// Also include raw 78-byte hex dump
+        /// Also include raw 152-byte hex dump
         #[arg(long)]
         hex: bool,
+
+        /// Number of live meter samples to poll (default 1)
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+
+        /// Delay in milliseconds between consecutive samples when --count > 1
+        #[arg(long, default_value_t = 100)]
+        interval_ms: u64,
     },
 
     /// Hardware preset slot management and local JSON preset import/export
@@ -264,26 +272,6 @@ fn parse_bool_flag(s: &str) -> Result<bool> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if !cli.simulator
-        && matches!(
-            cli.command,
-            None | Some(Commands::Status)
-                | Some(Commands::Clock {
-                    source: None,
-                    rate: None
-                })
-        )
-    {
-        let discovery = audiofuse_core::probe_linux_host_hardware();
-        if discovery.usb_present {
-            let payload = serde_json::json!({"backend":"Linux sysfs / ALSA (read-only)", "hardware_detected":true,"discovery":discovery});
-            println!("{}", serde_json::to_string_pretty(&payload)?);
-            if let Some(e) = discovery.alsa_error {
-                bail!("ALSA discovery failed: {e}");
-            }
-            return Ok(());
-        }
-    }
     if let Some(Commands::Firmware {
         action: FirmwareCommand::Inspect { path: Some(path) },
     }) = &cli.command
@@ -609,8 +597,8 @@ fn main() -> Result<()> {
                     "clock_locked": cfg.clock_locked,
                     "clock_validity": {
                         "internal_41": cfg.clock_validity[0],
-                        "adat_43": cfg.clock_validity[1],
-                        "wordclock_44": cfg.clock_validity[2],
+                        "wordclock_43": cfg.clock_validity[2],
+                        "adat_44": cfg.clock_validity[1],
                     },
                     "sample_rate_hz": cfg.sample_rate.to_hz(),
                     "sample_rate_label": cfg.sample_rate.khz_label(),
@@ -670,26 +658,49 @@ fn main() -> Result<()> {
                 print_prefs(&ctrl);
             }
         }
-        Commands::Meters { hex } => {
-            let bulk = ctrl.poll_bulk_state_and_meters()?;
-            if cli.json {
-                let hex_str: String = bulk.iter().map(|b| format!("{:02x}", b)).collect();
-                let payload = serde_json::json!({
-                    "payload_size_bytes": bulk.len(),
-                    "bulk_hex_78b": hex_str,
-                    "analog_in_vu": ctrl.state().inputs.iter().map(|c| c.vu).collect::<Vec<_>>(),
-                    "adat_in_vu": ctrl.state().adat_in_vu,
-                    "usb_in_vu": ctrl.state().usb_in_vu,
-                    "analog_out_vu": ctrl.state().routing.analog_out_vu,
-                    "adat_out_vu": ctrl.state().routing.adat_out_vu,
-                    "mixer_main_vu": [ctrl.state().monitor.mixer_main_vu_l, ctrl.state().monitor.mixer_main_vu_r],
-                    "speakers_vu": [ctrl.state().monitor.speakers_vu_l, ctrl.state().monitor.speakers_vu_r],
-                    "phones_vu": [ctrl.state().monitor.phones_vu_l, ctrl.state().monitor.phones_vu_r],
-                    "loopback_vu": [ctrl.state().routing.loopback_vu_l, ctrl.state().routing.loopback_vu_r],
-                });
-                println!("{}", serde_json::to_string_pretty(&payload)?);
-            } else {
-                print_meters(&ctrl, &bulk, hex);
+        Commands::Meters {
+            hex,
+            count,
+            interval_ms,
+        } => {
+            let samples = count.max(1);
+            let mut json_frames = Vec::new();
+            for sample_idx in 0..samples {
+                if sample_idx > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                }
+                let vu_152 = ctrl.poll_vu_meters()?;
+                if cli.json {
+                    let hex_str: String = vu_152.iter().map(|b| format!("{:02x}", b)).collect();
+                    let frame = serde_json::json!({
+                        "sample": sample_idx + 1,
+                        "vu_unit_id": "0x11",
+                        "payload_size_bytes": vu_152.len(),
+                        "vu_hex_152b": hex_str,
+                        "analog_in_vu": ctrl.state().inputs.iter().map(|c| c.vu).collect::<Vec<_>>(),
+                        "adat_in_vu": ctrl.state().adat_in_vu,
+                        "usb_in_vu": ctrl.state().usb_in_vu,
+                        "analog_out_vu": ctrl.state().routing.analog_out_vu,
+                        "adat_out_vu": ctrl.state().routing.adat_out_vu,
+                        "mixer_main_vu": [ctrl.state().monitor.mixer_main_vu_l, ctrl.state().monitor.mixer_main_vu_r],
+                        "speakers_vu": [ctrl.state().monitor.speakers_vu_l, ctrl.state().monitor.speakers_vu_r],
+                        "phones_vu": [ctrl.state().monitor.phones_vu_l, ctrl.state().monitor.phones_vu_r],
+                        "loopback_vu": [ctrl.state().routing.loopback_vu_l, ctrl.state().routing.loopback_vu_r],
+                    });
+                    if samples == 1 {
+                        println!("{}", serde_json::to_string_pretty(&frame)?);
+                    } else {
+                        json_frames.push(frame);
+                    }
+                } else {
+                    if samples > 1 {
+                        println!("=== SAMPLE {}/{} ===", sample_idx + 1, samples);
+                    }
+                    print_meters(&ctrl, &vu_152, hex);
+                }
+            }
+            if cli.json && samples > 1 {
+                println!("{}", serde_json::to_string_pretty(&json_frames)?);
             }
         }
         Commands::Preset { action } => match action {
@@ -875,17 +886,17 @@ fn print_clock(ctrl: &AudioFuseController) {
         }
     );
     println!(
-        "Clock Validity  : Internal(41)={} | ADAT(43)={} | WordClock(44)={}",
+        "Clock Validity  : Internal(41)={} | WordClock(43)={} | ADAT(44)={}",
         if cfg.clock_validity[0] { "VALID" } else { "NO" },
-        if cfg.clock_validity[1] { "VALID" } else { "NO" },
-        if cfg.clock_validity[2] { "VALID" } else { "NO" }
+        if cfg.clock_validity[2] { "VALID" } else { "NO" },
+        if cfg.clock_validity[1] { "VALID" } else { "NO" }
     );
     println!("Sample Rate     : {}", cfg.sample_rate);
 }
 
 fn print_prefs(ctrl: &AudioFuseController) {
     let cfg = &ctrl.state().config;
-    println!("--- DEVICE PREFERENCES (AFEXDevice Unit 0x0a) ---");
+    println!("--- DEVICE PREFERENCES (AFEX Unit 0x0a / State Unit 0x0d) ---");
     println!(
         "Device Mode     : {} | ADAT Optical: {} | S/MUX: {}",
         cfg.device_mode,
@@ -955,16 +966,25 @@ fn print_routing(ctrl: &AudioFuseController) {
     let mon = &ctrl.state().monitor;
     let rt = &ctrl.state().routing;
     println!("--- MASTER MONITOR & CUE SECTION ---");
-    println!(
-        "Cue Master Out  : {} | Mute={} | Solo={} | Direct/USB Balance={:.0}%/{:.0}% | VU L/R={}/{}",
-        format_db(mon.mixer_output_level_db),
-        if mon.mixer_output_mute { "ON" } else { "OFF" },
-        if mon.mixer_output_solo { "ON" } else { "OFF" },
-        (1.0 - mon.direct_computer_mix) * 100.0,
-        mon.direct_computer_mix * 100.0,
-        mon.mixer_main_vu_l,
-        mon.mixer_main_vu_r
-    );
+    if ctrl.is_simulated() {
+        println!(
+            "Cue Master Out  : {} | Mute={} | Solo={} | Direct/USB Balance={:.0}%/{:.0}% | VU L/R={}/{}",
+            format_db(mon.mixer_output_level_db),
+            if mon.mixer_output_mute { "ON" } else { "OFF" },
+            if mon.mixer_output_solo { "ON" } else { "OFF" },
+            (1.0 - mon.direct_computer_mix) * 100.0,
+            mon.direct_computer_mix * 100.0,
+            mon.mixer_main_vu_l,
+            mon.mixer_main_vu_r
+        );
+    } else {
+        println!(
+            "Cue Master Out  : {} | VU L/R={}/{} (Master Mute/Solo & Direct Mix not in hardware)",
+            format_db(mon.mixer_output_level_db),
+            mon.mixer_main_vu_l,
+            mon.mixer_main_vu_r
+        );
+    }
     println!(
         "Speakers Out    : Source={:12} | Mono={:3} | VU L/R={}/{}",
         mon.speakers_source.as_str(),
@@ -1001,9 +1021,9 @@ fn print_routing(ctrl: &AudioFuseController) {
     );
 }
 
-fn print_meters(ctrl: &AudioFuseController, bulk: &[u8], include_hex: bool) {
+fn print_meters(ctrl: &AudioFuseController, vu_152: &[u8], include_hex: bool) {
     let s = ctrl.state();
-    println!("--- REAL-TIME HARDWARE VU METERS (0x4e / 78-Byte Bulk Payload) ---");
+    println!("--- REAL-TIME HARDWARE VU METERS (Unit 0x11 / 152-Byte Telemetry) ---");
     print!("Analog In 1-8 : ");
     for i in 0..8 {
         print!("Ch{}:{:3} ", i + 1, s.inputs[i].vu);
@@ -1041,8 +1061,8 @@ fn print_meters(ctrl: &AudioFuseController, bulk: &[u8], include_hex: bool) {
         s.routing.loopback_vu_r
     );
     if include_hex {
-        println!("\nRaw 78-byte payload (0x4e):");
-        for (idx, chunk) in bulk.chunks(16).enumerate() {
+        println!("\nRaw 152-byte payload (Unit 0x11, 38 x i32 LE):");
+        for (idx, chunk) in vu_152.chunks(16).enumerate() {
             print!("{:04x}: ", idx * 16);
             for b in chunk {
                 print!("{:02x} ", b);

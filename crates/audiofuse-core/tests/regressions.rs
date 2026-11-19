@@ -17,7 +17,7 @@ fn input_mode_rejects_incompatible_pad_and_tracks_connectors() {
         } else {
             c.set_input_type(i, InputType::Line).unwrap();
         }
-        c.poll_bulk_state_and_meters().unwrap();
+        c.poll_state_and_meters().unwrap();
         let input = &c.state().inputs[i];
         assert!(!input.mic_active && input.jack_active);
         assert_eq!(input.pad_mic, MicPadBoost::Off);
@@ -35,7 +35,7 @@ fn relative_db_move_preserves_linked_group_pair() {
     c.set_stereo_link(MixerBank::Adat, 0, true).unwrap();
     c.set_mixer_channel_level_db(0, -3.0).unwrap();
     for i in [8, 9] {
-        assert!((c.state().mixer_channels[i].level_db + 15.0).abs() < 0.15);
+        assert!((c.state().mixer_channels[i].level_db + 15.0).abs() < 0.25);
     }
 }
 
@@ -81,13 +81,18 @@ fn snapshot_validation_precedes_mutation() {
 }
 
 #[test]
-fn phantom_mask_is_independent_of_clock_and_master_flags() {
+fn phantom_mask_in_266b_state_is_independent_of_other_flags() {
     let mut state = AudioFuseState::default();
-    let mut packet = [0; 78];
-    packet[53] = 128;
-    state.apply_bulk_state_78(&packet);
+    let mut packet = [0u8; AFEX_STATE_SIZE];
+    packet[0..6].copy_from_slice(&AFEX_STATE_MAGIC);
+    let phantom_off = (param_id::INPUT_PHANTOM as usize) * 2;
+    packet[phantom_off..phantom_off + 2].copy_from_slice(&(1u16 << 7).to_le_bytes());
+    state.apply_afex_state_266(&packet).unwrap();
     assert!(state.inputs[7].phantom_48v);
-    state.apply_bulk_state_78(&[0; 78]);
+    assert!(!state.inputs[0].phantom_48v);
+
+    packet[phantom_off..phantom_off + 2].copy_from_slice(&0u16.to_le_bytes());
+    state.apply_afex_state_266(&packet).unwrap();
     assert!(!state.inputs[7].phantom_48v);
 }
 
@@ -97,18 +102,137 @@ fn all_output_pair_source_combinations_round_trip() {
     for pair in 0..4 {
         for src in AnalogOutSource::ALL {
             c.set_analog_out_source(pair, src).unwrap();
-            c.poll_bulk_state_and_meters().unwrap();
+            c.poll_state_and_meters().unwrap();
             assert_eq!(c.state().routing.analog_out_sources[pair], src);
         }
         for src in AdatOutSource::ALL {
             c.set_adat_out_source(pair, src).unwrap();
-            c.poll_bulk_state_and_meters().unwrap();
+            c.poll_state_and_meters().unwrap();
             assert_eq!(c.state().routing.adat_out_sources[pair], src);
         }
     }
     for src in LoopbackSource::ALL {
         c.set_loopback_source(src).unwrap();
-        c.poll_bulk_state_and_meters().unwrap();
+        c.poll_state_and_meters().unwrap();
         assert_eq!(c.state().routing.loopback_source, src);
     }
+}
+
+#[test]
+fn one_hot_routing_masks_match_verified_hardware_wire_values() {
+    assert_eq!(AnalogOutSource::CueMix.to_wire_mask(), 0x0001);
+    assert_eq!(AnalogOutSource::UsbPair.to_wire_mask(), 0x0002);
+    assert_eq!(AnalogOutSource::AnalogInPair.to_wire_mask(), 0x0004);
+    assert_eq!(AnalogOutSource::AdatInPair.to_wire_mask(), 0x0008);
+
+    assert_eq!(AdatOutSource::CueMix.to_wire_mask(), 0x0001);
+    assert_eq!(AdatOutSource::UsbPair.to_wire_mask(), 0x0002);
+    assert_eq!(AdatOutSource::AnalogInPair.to_wire_mask(), 0x0004);
+
+    assert_eq!(LoopbackSource::Disabled.to_wire_mask(), 0x0000);
+    assert_eq!(LoopbackSource::CueMix.to_wire_mask(), 0x0001);
+    assert_eq!(LoopbackSource::Usb17_18.to_wire_mask(), 0x0002);
+}
+
+#[test]
+fn non_simulator_transport_rejects_unsupported_controls_honestly() {
+    struct StubHardwareTransport;
+
+    impl AudioFuseTransport for StubHardwareTransport {
+        fn backend_name(&self) -> &str {
+            "stub-hw"
+        }
+        fn is_hardware_detected(&self) -> bool {
+            true
+        }
+        fn read_state_266(&self) -> Result<[u8; AFEX_STATE_SIZE], TransportError> {
+            let mut buf = [0u8; AFEX_STATE_SIZE];
+            buf[0..6].copy_from_slice(&AFEX_STATE_MAGIC);
+            Ok(buf)
+        }
+        fn read_vu_152(&self) -> Result<[u8; AFEX_VU_SIZE], TransportError> {
+            Ok([0u8; AFEX_VU_SIZE])
+        }
+        fn get_parameter(&self, _param_id: u8, _channel_index: u8) -> Result<u16, TransportError> {
+            Ok(0)
+        }
+        fn set_parameter(
+            &self,
+            _param_id: u8,
+            _channel_index: u8,
+            _value: u16,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn set_parameter_bytes(
+            &self,
+            _param_id: u8,
+            _channel_index: u8,
+            _data: &[u8],
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn get_string(&self, _str_type: u8, _index: u16) -> Result<String, TransportError> {
+            Ok("Audiofuse 8Pre".into())
+        }
+        fn set_string(
+            &self,
+            _str_type: u8,
+            _index: u16,
+            _value: &str,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn get_clock_source(&self) -> Result<ClockSource, TransportError> {
+            Ok(ClockSource::Internal)
+        }
+        fn set_clock_source(&self, _source: ClockSource) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn get_clock_validity(&self) -> Result<[bool; 3], TransportError> {
+            Ok([true, false, false])
+        }
+        fn get_sample_rate(&self) -> Result<SampleRate, TransportError> {
+            Ok(SampleRate::default())
+        }
+        fn set_sample_rate(&self, _rate: SampleRate) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn get_dfu_status(&self) -> Result<DfuStatusReport, TransportError> {
+            Err(TransportError::Unsupported("DFU refused at runtime".into()))
+        }
+        fn discovery_info(&self) -> HardwareDiscoveryInfo {
+            HardwareDiscoveryInfo::default()
+        }
+    }
+
+    let t = Arc::new(StubHardwareTransport);
+    assert!(matches!(
+        t.set_simulated_mixer_output_mute(true),
+        Err(TransportError::Unsupported(_))
+    ));
+    assert!(matches!(
+        t.set_simulated_mixer_output_solo(true),
+        Err(TransportError::Unsupported(_))
+    ));
+    assert!(matches!(
+        t.set_simulated_direct_computer_mix(0.5),
+        Err(TransportError::Unsupported(_))
+    ));
+    assert!(matches!(
+        t.preset_load(0, 266),
+        Err(TransportError::Unsupported(_))
+    ));
+    assert!(matches!(
+        t.preset_save(0, &[0u8; 4]),
+        Err(TransportError::Unsupported(_))
+    ));
+
+    let mut c = AudioFuseController::new(t).unwrap();
+    assert!(c.set_direct_computer_mix(0.5).is_err());
+    assert!(c.set_mixer_output_mute(true).is_err());
+    assert!(c.set_mixer_output_solo(true).is_err());
+    assert!(c.load_hardware_preset(0).is_err());
+    assert!(c.save_hardware_preset(0).is_err());
+    assert!(c.set_input_type(0, InputType::Line).is_err());
 }

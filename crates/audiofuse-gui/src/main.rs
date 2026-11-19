@@ -45,8 +45,8 @@ struct GuiArgs {
 
 fn main() -> Result<()> {
     let args = GuiArgs::parse();
-    let controller = open_best_available_transport(args.screenshot.is_some() || args.simulator)
-        .and_then(AudioFuseController::new);
+    let controller =
+        open_best_available_transport(args.simulator).and_then(AudioFuseController::new);
     let theme_mode = if args.light {
         StudioThemeMode::LightPaper
     } else {

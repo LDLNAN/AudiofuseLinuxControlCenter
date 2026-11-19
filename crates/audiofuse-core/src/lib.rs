@@ -8,7 +8,7 @@ pub mod protocol;
 pub mod state;
 pub mod transport;
 
-pub use controller::AudioFuseController;
+pub use controller::{AudioFuseController, TelemetryFrame};
 pub use firmware::{
     Af8PreImageEntry, Af8PreManifest, DfuState, DfuStatusReport, FirmwareError, FirmwareInspection,
     InspectedFirmwareImage, chunk_firmware_into_dfu_blocks, inspect_af8pre_bytes,
@@ -34,30 +34,35 @@ mod tests {
     #[test]
     fn test_af001_wvalue_and_windex_encoding() {
         assert_eq!(AFEX_DEFAULT_WINDEX, 0x0a00);
+        assert_eq!(AFEX_STATE_WINDEX, 0x0d00);
+        assert_eq!(AFEX_VU_WINDEX, 0x1100);
         for param_id in [
+            param_id::INPUT_PAD_MIC,
+            param_id::INPUT_PAD_LINE,
+            param_id::INPUT_INST,
+            param_id::INPUT_PHASE_INVERT,
+            param_id::SPEAKERS_SOURCE,
+            param_id::PHONES_SOURCE,
+            param_id::SPEAKERS_MONO,
+            param_id::PHONES_MONO,
+            param_id::INPUT_PHANTOM,
+            param_id::MIXER_CH_GAIN_L,
+            param_id::MIXER_CH_GAIN_R,
+            param_id::MIXER_MUTE_ANALOG_ADAT,
+            param_id::MIXER_MUTE_USB,
+            param_id::MIXER_SOLO_ANALOG_ADAT,
+            param_id::MIXER_SOLO_USB,
+            param_id::MIXER_OUT_LEVEL,
+            param_id::MIXER_STEREO_SHOW,
             param_id::DEVICE_MODE,
-            param_id::ADAT_ON,
+            param_id::DEVICE_NAME,
             param_id::WORDCLOCK_IMPEDANCE,
             param_id::WORDCLOCK_THRU,
-            param_id::SMUX_MODE,
-            param_id::INPUT_TYPE,
-            param_id::INPUT_PAD_BOOST,
-            param_id::INPUT_PHANTOM,
-            param_id::INPUT_PHASE_INVERT,
-            param_id::INPUT_INST,
-            param_id::MIXER_CH_MUTE,
-            param_id::MIXER_CH_SOLO,
-            param_id::MIXER_CH_PAN,
-            param_id::MIXER_CH_LEVEL,
-            param_id::MIXER_OUT_MUTE,
-            param_id::MIXER_OUT_LEVEL,
-            param_id::SPEAKERS_SOURCE,
-            param_id::SPEAKERS_MONO,
-            param_id::PHONES_SOURCE,
-            param_id::PHONES_MONO,
             param_id::ANALOG_OUT_SOURCE,
             param_id::ADAT_OUT_SOURCE,
             param_id::LOOPBACK_SOURCE,
+            param_id::SMUX_MODE,
+            param_id::ADAT_ON,
         ] {
             for idx in 0..24u8 {
                 let wval = encode_param_wvalue(param_id, idx);
@@ -72,12 +77,17 @@ mod tests {
         let sim = Arc::new(SimulatedTransport::default());
         let mut ctrl = AudioFuseController::new(sim.clone()).unwrap();
 
+        // Verified USB descriptors & ALSA mapping:
+        // Pin 1 -> Entity 41 (0x29) Internal, Pin 2 -> Entity 43 (0x2B) WORD, Pin 3 -> Entity 44 (0x2C) ADAT
         assert_eq!(ClockSource::Internal.to_uac2_pin(), 1);
-        assert_eq!(ClockSource::Adat.to_uac2_pin(), 2);
-        assert_eq!(ClockSource::WordClock.to_uac2_pin(), 3);
+        assert_eq!(ClockSource::WordClock.to_uac2_pin(), 2);
+        assert_eq!(ClockSource::Adat.to_uac2_pin(), 3);
+        assert_eq!(ClockSource::from_uac2_pin(1), ClockSource::Internal);
+        assert_eq!(ClockSource::from_uac2_pin(2), ClockSource::WordClock);
+        assert_eq!(ClockSource::from_uac2_pin(3), ClockSource::Adat);
         assert_eq!(ClockSource::Internal.uac2_clock_entity(), 0x29);
-        assert_eq!(ClockSource::Adat.uac2_clock_entity(), 0x2b);
-        assert_eq!(ClockSource::WordClock.uac2_clock_entity(), 0x2c);
+        assert_eq!(ClockSource::WordClock.uac2_clock_entity(), 0x2b);
+        assert_eq!(ClockSource::Adat.uac2_clock_entity(), 0x2c);
 
         for sr in SampleRate::ALL {
             ctrl.set_sample_rate(sr).unwrap();
@@ -87,8 +97,8 @@ mod tests {
 
         for cs in [
             ClockSource::Internal,
-            ClockSource::Adat,
             ClockSource::WordClock,
+            ClockSource::Adat,
         ] {
             ctrl.set_clock_source(cs).unwrap();
             assert_eq!(ctrl.state().config.clock_source, cs);
@@ -107,7 +117,7 @@ mod tests {
         assert_eq!(ctrl.state().inputs[0].input_type, InputType::Inst);
         assert_eq!(sim.get_parameter(param_id::INPUT_INST, 0).unwrap(), 1);
 
-        // Channels 3..8 reject Inst Hi-Z and clamp to Line
+        // Channels 3..8 reject Inst Hi-Z and clamp to Line in simulator
         ctrl.set_input_type(2, InputType::Inst).unwrap();
         assert_eq!(ctrl.state().inputs[2].input_type, InputType::Line);
         assert!(!ctrl.state().inputs[2].inst_hi_z);
@@ -127,6 +137,7 @@ mod tests {
         }
 
         // Phase invert, Line Pad (-20dB), and Mic Pad/Boost
+        ctrl.set_input_type(5, InputType::ComboAuto).unwrap();
         ctrl.set_input_phase_invert(5, true).unwrap();
         ctrl.set_input_line_pad(5, LinePad::Pad20dB).unwrap();
         ctrl.set_input_mic_pad_boost(5, MicPadBoost::Boost).unwrap();
@@ -136,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn test_af003_piecewise_linear_fader_curve_and_cue_mixer() {
+    fn test_af003_piecewise_linear_fader_and_q88_constant_power_pan() {
         // Knee at 0.842105263 -> 0.0 dB
         assert!((fader_normalized_to_db(0.0) - (-61.0)).abs() < 1e-4);
         assert!((fader_normalized_to_db(MIXER_FADER_KNEE) - 0.0).abs() < 1e-4);
@@ -145,6 +156,22 @@ mod tests {
         assert!((fader_db_to_normalized(-61.0) - 0.0).abs() < 1e-4);
         assert!((fader_db_to_normalized(0.0) - MIXER_FADER_KNEE).abs() < 1e-4);
         assert!((fader_db_to_normalized(12.0) - 1.0).abs() < 1e-4);
+
+        // Constant-power Q8.8 pan law round-trip matching real hardware registers 0x20 / 0x38
+        let (l_c, r_c) = encode_mixer_channel_gains_q88(0.0, 0);
+        assert!((l_c - (-771)).abs() <= 3 && (r_c - (-771)).abs() <= 3);
+        let (db_c, pan_c) = decode_mixer_channel_gains_q88(l_c, r_c);
+        assert!((db_c - 0.0).abs() <= 0.1 && pan_c == 0);
+
+        let (l_hl, r_hl) = encode_mixer_channel_gains_q88(0.0, -64);
+        assert_eq!(l_hl, 0);
+        assert_eq!(r_hl, i16::MIN);
+        assert_eq!(decode_mixer_channel_gains_q88(l_hl, r_hl), (0.0, -64));
+
+        let (l_hr, r_hr) = encode_mixer_channel_gains_q88(0.0, 64);
+        assert_eq!(l_hr, i16::MIN);
+        assert_eq!(r_hr, 0);
+        assert_eq!(decode_mixer_channel_gains_q88(l_hr, r_hr), (0.0, 64));
 
         assert_eq!(format_db(-61.0), "-inf dB");
         assert_eq!(format_db(-60.6), "-inf dB");
@@ -176,7 +203,7 @@ mod tests {
         assert!(ctrl.state().mixer_channels[8].mute);
         assert!(ctrl.state().mixer_channels[16].mute);
 
-        // 16-char custom channel naming
+        // 16-char custom channel naming in simulator
         ctrl.set_mixer_channel_name(0, "Kick Drum Sub In 12345")
             .unwrap();
         assert_eq!(ctrl.state().mixer_channels[0].name.len(), 16);
@@ -245,56 +272,92 @@ mod tests {
     }
 
     #[test]
-    fn test_af005_bulk_state_78_byte_roundtrip_and_vu_polling() {
+    fn test_af005_verified_266b_state_and_152b_vu_roundtrip() {
         let mut state = AudioFuseState::default();
+        state.config.device_name = "Studio 8Pre".to_string();
         state.config.device_mode = DeviceMode::Adat;
-        state.config.sample_rate = SampleRate::Rate96000;
-        state.config.clock_source = ClockSource::WordClock;
         state.config.wordclock_impedance = WordclockImpedance::HiZ;
         state.config.wordclock_thru = true;
         state.config.smux_mode = SmuxMode::DoubleSpeed;
+        state.config.adat_on = false;
         state.inputs[0].phantom_48v = true;
         state.inputs[0].inst_hi_z = true;
         state.inputs[0].input_type = InputType::Inst;
         state.inputs[3].phase_invert = true;
         state.inputs[3].pad_line = LinePad::Pad20dB;
         state.inputs[3].pad_mic = MicPadBoost::Boost;
-        state.inputs[0].vu = 115;
-        state.adat_in_vu[2] = 77;
-        state.usb_in_vu[7] = 104;
-        state.mixer_channels[5].peak = true;
+        state.mixer_channels[5].level_db = -9.5;
+        state.mixer_channels[5].pan = -32;
         state.mixer_channels[5].mute = true;
         state.mixer_channels[12].solo = true;
+        state.mixer_channels[18].mute = true;
+        state.stereo_links[2].pair_1_2 = true;
+        state.monitor.mixer_output_level_db = -6.0;
         state.monitor.speakers_source = SpeakersSource::CueMix;
+        state.monitor.speakers_mono = true;
         state.monitor.phones_source = PhonesSource::FollowSpeakers;
+        state.monitor.phones_mono = true;
+        state.routing.analog_out_sources[0] = AnalogOutSource::AdatInPair;
+        state.routing.adat_out_sources[1] = AdatOutSource::AnalogInPair;
         state.routing.loopback_source = LoopbackSource::Usb17_18;
 
-        let encoded = state.encode_bulk_state_78();
-        assert_eq!(encoded.len(), 78);
+        let encoded = state.encode_afex_state_266();
+        assert_eq!(encoded.len(), AFEX_STATE_SIZE);
+        assert_eq!(&encoded[0..6], &AFEX_STATE_MAGIC);
 
         let mut decoded = AudioFuseState::default();
-        decoded.apply_bulk_state_78(&encoded);
+        decoded.apply_afex_state_266(&encoded).unwrap();
 
+        assert_eq!(decoded.config.device_name, "Studio 8Pre");
         assert_eq!(decoded.config.device_mode, DeviceMode::Adat);
-        assert_eq!(decoded.config.sample_rate, SampleRate::Rate96000);
-        assert_eq!(decoded.config.clock_source, ClockSource::WordClock);
         assert_eq!(decoded.config.wordclock_impedance, WordclockImpedance::HiZ);
         assert!(decoded.config.wordclock_thru);
         assert_eq!(decoded.config.smux_mode, SmuxMode::DoubleSpeed);
+        assert!(!decoded.config.adat_on);
         assert!(decoded.inputs[0].phantom_48v);
         assert!(decoded.inputs[0].inst_hi_z);
         assert!(decoded.inputs[3].phase_invert);
         assert_eq!(decoded.inputs[3].pad_line, LinePad::Pad20dB);
         assert_eq!(decoded.inputs[3].pad_mic, MicPadBoost::Boost);
-        assert_eq!(decoded.inputs[0].vu, 115);
-        assert_eq!(decoded.adat_in_vu[2], 77);
-        assert_eq!(decoded.usb_in_vu[7], 104);
-        assert!(decoded.mixer_channels[5].peak);
+        assert!((decoded.mixer_channels[5].level_db - (-9.5)).abs() <= 0.15);
+        assert!((decoded.mixer_channels[5].pan - (-32)).abs() <= 1);
         assert!(decoded.mixer_channels[5].mute);
         assert!(decoded.mixer_channels[12].solo);
+        assert!(decoded.mixer_channels[18].mute);
+        assert!(decoded.stereo_links[2].pair_1_2);
+        assert!((decoded.monitor.mixer_output_level_db - (-6.0)).abs() <= 0.1);
         assert_eq!(decoded.monitor.speakers_source, SpeakersSource::CueMix);
-        assert_eq!(decoded.monitor.phones_source, PhonesSource::FollowSpeakers);
-        assert_eq!(decoded.routing.loopback_source, LoopbackSource::Usb17_18);
+        assert!(decoded.monitor.speakers_mono);
+        assert_eq!(
+            decoded.monitor.phones_source,
+            PhonesSource::FollowSpeakers
+        );
+        assert!(decoded.monitor.phones_mono);
+        assert_eq!(
+            decoded.routing.analog_out_sources[0],
+            AnalogOutSource::AdatInPair
+        );
+        assert_eq!(
+            decoded.routing.adat_out_sources[1],
+            AdatOutSource::AnalogInPair
+        );
+        assert_eq!(
+            decoded.routing.loopback_source,
+            LoopbackSource::Usb17_18
+        );
+
+        // Verify 152-byte live VU packet decoding & routing derivation
+        let mut vu_buf = [0u8; AFEX_VU_SIZE];
+        let full_scale_24: i32 = 8_388_607 << 8; // 0 dBFS -> 127
+        let half_scale_24: i32 = 4_194_304 << 8; // ~ -6 dBFS -> ~114
+        vu_buf[0..4].copy_from_slice(&half_scale_24.to_le_bytes()); // Analog In 1
+        vu_buf[36 * 4..37 * 4].copy_from_slice(&full_scale_24.to_le_bytes()); // Cue Mix L
+        vu_buf[37 * 4..38 * 4].copy_from_slice(&half_scale_24.to_le_bytes()); // Cue Mix R
+        decoded.apply_afex_vu_152(&vu_buf);
+        assert!(decoded.inputs[0].vu >= 112 && decoded.inputs[0].vu <= 116);
+        assert_eq!(decoded.monitor.mixer_main_vu_l, 127);
+        assert_eq!(decoded.monitor.speakers_vu_l, 127); // Speakers = CueMix
+        assert_eq!(decoded.monitor.phones_vu_l, 127); // Phones = FollowSpeakers
     }
 
     #[test]
