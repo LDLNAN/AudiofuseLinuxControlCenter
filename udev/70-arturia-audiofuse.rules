@@ -1,0 +1,9 @@
+# Arturia AudioFuse 8Pre (1c75:af0e) non-root USB & DFU access rules
+# Install to /etc/udev/rules.d/70-arturia-audiofuse.rules and run:
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# Arturia AudioFuse 8Pre — USB Audio Class 2.0 + AFEXDevice Vendor Control (Interface 0) & USB DFU (Interface 3)
+SUBSYSTEM=="usb", ATTR{idVendor}=="1c75", ATTR{idProduct}=="af0e", MODE="0660", GROUP="audio", TAG+="uaccess"
+
+# Also match any hidraw or usb_device child nodes exposed by Arturia AudioFuse hardware
+KERNEL=="hidraw*", ATTRS{idVendor}=="1c75", ATTRS{idProduct}=="af0e", MODE="0660", GROUP="audio", TAG+="uaccess"

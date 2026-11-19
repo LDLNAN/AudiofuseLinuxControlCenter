@@ -1,0 +1,111 @@
+name: Linux packages
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev pkg-config xvfb libx11-xcb1 libxcursor1 libxi6 libxkbcommon-x11-0 libegl1 libgl1-mesa-dri
+      - run: cargo test --locked --workspace && cargo build --locked --release --workspace
+      - run: packaging/source-archive.sh
+      - name: Build and exercise Debian, portable and AppImage payloads
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: |
+          set -eu
+          bash packaging/debian/build-deb.sh
+          dpkg-deb -x *.deb target/deb-smoke
+          target/deb-smoke/usr/bin/audiofuse-cli --simulator status
+          xvfb-run -a target/deb-smoke/usr/bin/audiofuse-control-center --screenshot target/deb.png
+          curl -fL https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage -o /usr/local/bin/appimagetool
+          chmod +x /usr/local/bin/appimagetool
+          bash packaging/appimage/build-appimage.sh
+          ./*.AppImage --cli --simulator status
+          xvfb-run -a ./*.AppImage --screenshot target/appimage.png
+          tar -C AppDir -czf dist/audiofuse-linux-x86_64.tar.gz .
+          cp *.deb *.AppImage dist/
+          cp packaging/arch/PKGBUILD dist/
+          cd dist
+          sum=$(sha256sum audiofuse-control-center-1.0.0.tar.gz | cut -d' ' -f1)
+          sed -i "s/'SKIP'/'$sum'/" PKGBUILD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/
+  distro:
+    needs: linux
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        format: [arch,rpm,flatpak]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux
+          path: dist
+      - name: Arch Linux
+        if: matrix.format == 'arch'
+        run: |
+          docker run --rm -v "$PWD/dist:/out" archlinux:base-devel bash -ec '
+            pacman -Syu --noconfirm rust libusb alsa-lib
+            useradd -m build
+            mkdir /tmp/pkg
+            cp /out/PKGBUILD /out/audiofuse-control-center-1.0.0.tar.gz /tmp/pkg/
+            chown -R build /tmp/pkg
+            cd /tmp/pkg
+            su build -c "makepkg --noconfirm"
+            pacman -U --noconfirm *.pkg.tar.zst
+            audiofuse-cli --simulator status
+            audiofuse-control-center --help
+            cp *.pkg.tar.zst /out/'
+      - name: Fedora
+        if: matrix.format == 'rpm'
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist:/out" fedora:latest bash -ec '
+            dnf install -y cargo gcc gcc-c++ rpm-build libusbx-devel alsa-lib-devel systemd-rpm-macros
+            mkdir -p ~/rpmbuild/SOURCES
+            cp /out/audiofuse-control-center-1.0.0.tar.gz ~/rpmbuild/SOURCES/
+            rpmbuild -bb /src/packaging/rpm/audiofuse-control-center.spec
+            dnf install -y ~/rpmbuild/RPMS/*/audiofuse-control-center-1*.rpm
+            audiofuse-cli --simulator status
+            audiofuse-control-center --help
+            cp ~/rpmbuild/RPMS/*/audiofuse-control-center-1*.rpm /out/'
+      - name: Flatpak
+        if: matrix.format == 'flatpak'
+        run: |
+          sudo apt-get update && sudo apt-get install -y flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak-builder --user --install-deps-from=flathub --repo=repo builddir packaging/flatpak/*.yml
+          app=io.github.LDLNAN.AudioFuseControlCenter
+          flatpak build-bundle repo dist/audiofuse.flatpak "$app"
+          flatpak install --user --noninteractive dist/audiofuse.flatpak
+          flatpak run --command=audiofuse-cli "$app" --simulator status
+          flatpak run "$app" --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.format }}
+          if-no-files-found: error
+          path: |
+            dist/*.rpm
+            dist/*.pkg.tar.zst
+            dist/*.flatpak
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: distro
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes dist/*

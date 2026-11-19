@@ -49,7 +49,7 @@ In `Arturia::AudioFuseLib::AFEXDevice` (inheriting from `Arturia::AudioFuseLib::
 
 ### Control Transfer Requests (`GenericUsbDevice`)
 
-All vendor/class control transfers target **Interface 0** (`wIndex` low byte = `0x00`, high byte = Unit ID `0x0a` -> `wIndex = 0x0a00` for unit-addressed requests):
+Unit-addressed class/interface parameter transfers target **Interface 0** (`wIndex` low byte = `0x00`, high byte = Unit ID `0x0a` -> `wIndex = 0x0a00` for unit-addressed requests):
 
 1. **Get / Set Parameter (`AFEXDevice::GetParameter` / `SetParameter`)**:
    - `wValue = ((param_id & 0xff) << 8) | (channel_index & 0xff)`
@@ -57,14 +57,12 @@ All vendor/class control transfers target **Interface 0** (`wIndex` low byte = `
    - `wLength = 2` (2-byte little-endian value)
    - Uses `LibusbAudioInterface` parameter control transfer (`bmRequestType = 0xa1` Class Interface IN for Get, `0x21` Class Interface OUT for Set; UAC2 `CS_SAM_FREQ_CONTROL` / vendor control selector in `wValue`).
 2. **Bulk State & VU Meter Read**:
-   - Reads `0x4e` (`78`) bytes containing real-time hardware state and channel VU levels.
+   - The request byte and field offsets are unknown. Endpoint 0x82 carries six-byte notifications. The simulator has its own offset map in state.rs. The known payload length is `0x4e` (`78`) bytes.
 3. **String Read / Write (`GenericUsbDevice::GetString` / `SetString`)**:
    - Used for `Device Name` and per-channel mixer `Name` (16 bytes max, ASCII).
-   - `GetString(type, index)`: `bmRequestType = 0xa1` (IN), `bRequest = 0x98 + type`, `wValue = 0`, `wIndex = index`, `wLength = 16` (`0x10`).
-   - `SetString(type, index, str)`: `bmRequestType = 0x21` (OUT), `bRequest = 0x18 + type`, `wValue = 0`, `wIndex = index`, `wLength = 16` (`0x10`), zero-padded 16-byte buffer.
-4. **Preset Load / Save (`GenericUsbDevice::PresetLoad` / `PresetSave`)**:
-   - `PresetLoad(slot, buf, len)`: `bmRequestType = 0xa1` (IN), `bRequest = 0x48`, `wValue = 0`, `wIndex = slot`, `wLength = len`.
-   - `PresetSave(slot, buf, len)`: `bmRequestType = 0x21` (OUT), `bRequest = 0x49`, `wValue = 0`, `wIndex = slot`, `wLength = len`.
+   - Library constants suggest request bases `0x98` and `0x18`. The USB recipient and placement of the logical index are unresolved. For an interface recipient, the low byte of `wIndex` identifies the interface. Passing a mixer index there addresses unrelated interfaces.
+4. **Preset Load / Save**:
+   - Library operations use identifiers `0x48` and `0x49`. The setup packet, slot placement and payload format require a confirmed trace. The AF8P encoding used in offline tests is a simulator format.
 5. **UAC2 Clock Source & Sample Rate**:
    - Clock Source (`Clock Selector`, Entity `40` / `0x28`): UAC2 `CS_CLOCK_SELECTOR_CONTROL` (`0x01`), 1-byte selector index (`1` = Internal `0x29`, `2` = ADAT `0x2B`, `3` = Word Clock `0x2C`), or via ALSA control `numid=4` (`ARTURIA Clock Selector Clock Source`).
    - Clock Lock Status: UAC2 `CS_CLOCK_VALID_CONTROL` (`0x02`) on Entities `41`, `43`, `44` (also exposed via ALSA `numid=1..3`).
@@ -196,3 +194,7 @@ In `AudioFuse Control Center` (`0x1006685d0..0x100669e70`), `AudiofuseExStateCon
   - `param_id = 0x08` (`8`), `idx = 0`: `Wordclock Impedance` (`75 Ohms` / `HiZ`)
   - `param_id = 0x09` (`9`), `idx = 0`: `Wordclock Thru`
   - `param_id = 0x0a` (`10`), `idx = 0`: `SMUX Mode`
+
+The additional simulator selectors 0x14 (line pad), 0x32 (master solo) and 0x33 (direct/computer mix) lack independent wire evidence. Native transfers using these values return an error. Native access requires an available Interface 0. The backend leaves kernel drivers attached.
+
+Runtime DFU status polling is disabled. During the coexistence test, a six-byte GETSTATUS on claimed Interface 3 returned appIDLE. The hub immediately disabled the port, the device re-enumerated, and ALSA control reads failed. The trigger is unresolved. Archive inspection runs entirely offline.

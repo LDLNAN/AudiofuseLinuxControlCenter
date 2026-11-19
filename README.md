@@ -54,6 +54,67 @@ See [`docs/PROTOCOL.md`](./docs/PROTOCOL.md) for the reverse-engineered paramete
 
 ---
 
+## Quick Start (Build, Udev Rules, & Run)
+
+### 1. Build from source
+
+Requires a Rust toolchain (`cargo`) and standard Linux USB/GUI system libraries (`libusb-1.0`, `pkg-config`, Wayland/X11 + OpenGL/EGL headers).
+
+```bash
+cargo build --release --workspace
+cargo test --workspace
+```
+
+This builds:
+- `target/release/audiofuse-control-center` — native desktop GUI
+- `target/release/audiofuse-cli` — scriptable CLI
+
+### 2. Install `udev` rules for non-root USB access
+
+By default on Linux, `/dev/bus/usb/<bus>/<dev>` for the AudioFuse 8Pre (`1c75:af0e`) is owned by `root:root` (`0664`), which prevents non-root USB control and DFU transfers. Install [`udev/70-arturia-audiofuse.rules`](./udev/70-arturia-audiofuse.rules) once so your desktop session (`uaccess`) and the `audio` group get read/write access:
+
+```bash
+make udev-reload
+```
+
+Or manually:
+
+```bash
+sudo install -Dm644 udev/70-arturia-audiofuse.rules /etc/udev/rules.d/70-arturia-audiofuse.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=1c75 --attr-match=idProduct=af0e
+```
+
+If your session does not grant `uaccess` ACLs, make sure your user is in the `audio` group (`sudo usermod -aG audio "$USER"` and log back in) and replug the interface if needed. You can verify permissions with:
+
+```bash
+lsusb -d 1c75:af0e
+./target/release/audiofuse-cli status
+```
+
+Install the rule on the host for AppImage and Flatpak too. A seat ACL grants access to the device node. ALSA normally owns the control interface. Discovery is read-only, and native initialization reports busy or unsupported controls. Start with `--simulator` for offline editing. Native telemetry, strings, preset slots and several control selectors still require trace confirmation.
+
+The release workflow targets x86-64. Portable binaries and AppImages inherit the glibc baseline of their build host (Ubuntu 22.04 in CI). Local builds can require newer glibc. Use a distribution build or the Flatpak runtime where needed.
+
+### 3. Run the GUI or CLI
+
+```bash
+# Desktop Control Center (carbon dark theme by default; add --light or --simulator if needed)
+./target/release/audiofuse-control-center
+
+# CLI status & metering
+./target/release/audiofuse-cli status
+./target/release/audiofuse-cli meters
+```
+
+To install system-wide binaries, `.desktop` entry, icon, and `udev` rules:
+
+```bash
+sudo make install
+```
+
+---
+
 ## Repository Structure
 
 - [`docs/PROTOCOL.md`](./docs/PROTOCOL.md) — Reverse-engineered Arturia AudioFuse 8Pre (`AFEXDevice`) USB protocol, parameter definitions, scaling curves, and GUI structure.

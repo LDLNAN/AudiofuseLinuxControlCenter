@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=AudioFuse Control Center
+GenericName=USB Audio Interface Control Center
+Comment=Studio hardware control, cue mixer, and routing matrix for the Arturia AudioFuse 8Pre (1c75:af0e)
+Exec=audiofuse-control-center
+TryExec=audiofuse-control-center
+Icon=audiofuse-control-center
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;HardwareSettings;
+Keywords=Arturia;AudioFuse;8Pre;UAC2;ALSA;PipeWire;Mixer;Studio;
+StartupWMClass=audiofuse-control-center

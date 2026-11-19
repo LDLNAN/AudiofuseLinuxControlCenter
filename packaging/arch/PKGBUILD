@@ -1,0 +1,34 @@
+# Maintainer: AudioFuse Linux Control Center Contributors
+pkgname=audiofuse-control-center
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Native Linux studio Control Center, cue mixer, and CLI for the Arturia AudioFuse 8Pre (1c75:af0e)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/LDLNAN/AudiofuseLinuxControlCenter"
+license=('MIT')
+depends=('libusb' 'alsa-lib' 'systemd-libs' 'libx11' 'libxcursor' 'libxi' 'libxkbcommon-x11' 'libglvnd' 'wayland')
+makedepends=('cargo' 'pkgconf')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP') # Release job computes the checksum for the matching local source archive.
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --workspace
+}
+
+check() {
+  cd "$srcdir/$pkgname-$pkgver"
+  cargo test --release --workspace
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+  install -Dm755 "target/release/audiofuse-control-center" "${pkgdir}/usr/bin/audiofuse-control-center"
+  install -Dm755 "target/release/audiofuse-cli" "${pkgdir}/usr/bin/audiofuse-cli"
+  install -Dm644 "udev/70-arturia-audiofuse.rules" "${pkgdir}/usr/lib/udev/rules.d/70-arturia-audiofuse.rules"
+  install -Dm644 "packaging/audiofuse-control-center.desktop" "${pkgdir}/usr/share/applications/audiofuse-control-center.desktop"
+  install -Dm644 "packaging/audiofuse-control-center.svg" "${pkgdir}/usr/share/icons/hicolor/scalable/apps/audiofuse-control-center.svg"
+  install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 "docs/PROTOCOL.md" "${pkgdir}/usr/share/doc/${pkgname}/PROTOCOL.md"
+}

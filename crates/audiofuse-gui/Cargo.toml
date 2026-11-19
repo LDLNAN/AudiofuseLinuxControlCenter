@@ -1,0 +1,21 @@
+[package]
+name = "audiofuse-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Linux studio desktop Control Center for the Arturia AudioFuse 8Pre (1c75:af0e)"
+
+[[bin]]
+name = "audiofuse-control-center"
+path = "src/main.rs"
+
+[dependencies]
+audiofuse-core = { path = "../audiofuse-core" }
+eframe.workspace = true
+egui.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
+ab_glyph.workspace = true

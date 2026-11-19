@@ -8,7 +8,6 @@ extracted/
 
 # Rust / Cargo build artifacts
 target/
-Cargo.lock
 
 # C / C++ / CMake / Meson build artifacts
 build/

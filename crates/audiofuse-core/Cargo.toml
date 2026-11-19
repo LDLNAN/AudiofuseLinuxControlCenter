@@ -1,0 +1,13 @@
+[package]
+name = "audiofuse-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native USB/UAC2 control backend, state controller, and protocol library for the Arturia AudioFuse 8Pre (1c75:af0e)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rusb.workspace = true
+zip.workspace = true
