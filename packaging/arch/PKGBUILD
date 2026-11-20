@@ -1,12 +1,13 @@
 # Maintainer: AudioFuse Linux Control Center Contributors
 pkgname=audiofuse-control-center
 pkgver=1.0.0
-pkgrel=1
+pkgrel=2
+install=audiofuse-control-center.install
 pkgdesc="Native Linux studio Control Center, cue mixer, and CLI for the Arturia AudioFuse 8Pre (1c75:af0e)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/LDLNAN/AudiofuseLinuxControlCenter"
 license=('MIT')
-depends=('libusb' 'alsa-lib' 'systemd-libs' 'libx11' 'libxcursor' 'libxi' 'libxkbcommon-x11' 'libglvnd' 'wayland')
+depends=('libusb' 'alsa-lib' 'alsa-utils' 'dkms' 'systemd-libs' 'libx11' 'libxcursor' 'libxi' 'libxkbcommon-x11' 'libglvnd' 'wayland')
 makedepends=('cargo' 'pkgconf')
 source=("$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP') # Release job computes the checksum for the matching local source archive.
@@ -24,6 +25,7 @@ check() {
 
 package() {
   cd "$srcdir/$pkgname-$pkgver"
+  make install-helper DESTDIR="$pkgdir"
   install -Dm755 "target/release/audiofuse-control-center" "${pkgdir}/usr/bin/audiofuse-control-center"
   install -Dm755 "target/release/audiofuse-cli" "${pkgdir}/usr/bin/audiofuse-cli"
   install -Dm644 "udev/70-arturia-audiofuse.rules" "${pkgdir}/usr/lib/udev/rules.d/70-arturia-audiofuse.rules"

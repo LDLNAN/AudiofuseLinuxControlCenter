@@ -16,6 +16,16 @@ build-options:
   env:
     CARGO_HOME: /run/build/audiofuse-control-center/cargo
 modules:
+  - name: alsa-utils
+    buildsystem: simple
+    build-commands:
+      - ./configure --prefix=/app --disable-alsamixer --disable-xmlto --disable-rst2man --disable-bat --disable-alsaconf --disable-alsaloop --disable-nls
+      - make -C amixer
+      - install -Dm755 amixer/amixer /app/bin/amixer
+    sources:
+      - type: archive
+        url: https://www.alsa-project.org/files/pub/utils/alsa-utils-1.2.14.tar.bz2
+        sha256: 0794c74d33fed943e7c50609c13089e409312b6c403d6ae8984fc429c0960741
   - name: audiofuse-control-center
     buildsystem: simple
     build-commands:

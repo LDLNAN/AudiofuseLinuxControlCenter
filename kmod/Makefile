@@ -21,4 +21,9 @@ install: all
 	$(MAKE) -C $(KDIR) M=$(PWD) $(LLVM_FLAGS) modules_install
 	depmod -a $(KVER)
 
-.PHONY: all clean install
+test-policy:
+	@bin=$$(mktemp /tmp/af8pre-policy-test.XXXXXX); \
+	trap 'rm -f "$$bin"' EXIT; \
+	cc -std=c11 -Wall -Wextra -Werror -I$(PWD) $(PWD)/test_policy.c -o "$$bin" && "$$bin"
+
+.PHONY: all clean install test-policy

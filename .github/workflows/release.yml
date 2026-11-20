@@ -11,6 +11,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev pkg-config xvfb libx11-xcb1 libxcursor1 libxi6 libxkbcommon-x11-0 libegl1 libgl1-mesa-dri
+      - run: make -C kmod test-policy && bash tests/dkms-hook.sh
+      - run: sudo apt-get install -y "linux-headers-$(uname -r)" && make -C kmod
       - run: cargo test --locked --workspace && cargo build --locked --release --workspace
       - run: packaging/source-archive.sh
       - name: Build and exercise Debian, portable and AppImage payloads
@@ -29,7 +31,7 @@ jobs:
           xvfb-run -a ./*.AppImage --screenshot target/appimage.png
           tar -C AppDir -czf dist/audiofuse-linux-x86_64.tar.gz .
           cp *.deb *.AppImage dist/
-          cp packaging/arch/PKGBUILD dist/
+          cp packaging/arch/{PKGBUILD,audiofuse-control-center.install} dist/
           cd dist
           sum=$(sha256sum audiofuse-control-center-1.0.0.tar.gz | cut -d' ' -f1)
           sed -i "s/'SKIP'/'$sum'/" PKGBUILD
@@ -53,10 +55,10 @@ jobs:
         if: matrix.format == 'arch'
         run: |
           docker run --rm -v "$PWD/dist:/out" archlinux:base-devel bash -ec '
-            pacman -Syu --noconfirm rust libusb alsa-lib
+            pacman -Syu --noconfirm rust libusb alsa-lib alsa-utils dkms
             useradd -m build
             mkdir /tmp/pkg
-            cp /out/PKGBUILD /out/audiofuse-control-center-1.0.0.tar.gz /tmp/pkg/
+            cp /out/PKGBUILD /out/audiofuse-control-center.install /out/audiofuse-control-center-1.0.0.tar.gz /tmp/pkg/
             chown -R build /tmp/pkg
             cd /tmp/pkg
             su build -c "makepkg --noconfirm"

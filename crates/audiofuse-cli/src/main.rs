@@ -52,11 +52,11 @@ enum Commands {
         channel: Option<u8>,
 
         /// Set input source type: input, mic, line, inst (inst valid on ch 1-2)
-        #[arg(long)]
+        #[arg(long, requires = "channel")]
         mode: Option<String>,
 
         /// Enable or disable +48V phantom power (on/off)
-        #[arg(long)]
+        #[arg(long, requires = "channel")]
         phantom: Option<String>,
 
         /// Enable or disable +48V phantom power for group 1-4 or 5-8 (e.g. --phantom-bank 1-4:on)
@@ -64,15 +64,15 @@ enum Commands {
         phantom_bank: Option<String>,
 
         /// Enable or disable phase invert (on/off)
-        #[arg(long)]
+        #[arg(long, requires = "channel")]
         phase: Option<String>,
 
         /// Set -20dB line pad (off / -20db)
-        #[arg(long)]
+        #[arg(long, requires = "channel")]
         line_pad: Option<String>,
 
         /// Set mic pad/boost (off / pad / boost)
-        #[arg(long)]
+        #[arg(long, requires = "channel")]
         mic_pad: Option<String>,
     },
 
@@ -83,27 +83,27 @@ enum Commands {
         channel: Option<u8>,
 
         /// Set channel fader level in dB (-61.0 to +12.0)
-        #[arg(long)]
+        #[arg(long, requires = "channel")]
         level: Option<f32>,
 
         /// Set channel pan (-64 to +64, 0 = Center)
-        #[arg(long)]
+        #[arg(long, requires = "channel")]
         pan: Option<i8>,
 
         /// Set channel mute (on/off)
-        #[arg(long)]
+        #[arg(long, requires = "channel")]
         mute: Option<String>,
 
         /// Set channel solo (on/off)
-        #[arg(long)]
+        #[arg(long, requires = "channel")]
         solo: Option<String>,
 
-        /// Set custom channel name (max 16 ASCII characters)
-        #[arg(long)]
+        /// Set simulator channel name (max 16 ASCII characters)
+        #[arg(long, requires = "channel")]
         name: Option<String>,
 
-        /// Assign channel group (0 = None, 1..=4 = Group 1-4)
-        #[arg(long)]
+        /// Assign host-local channel group (0 = None, 1..=4 = Group 1-4)
+        #[arg(long, requires = "channel")]
         group: Option<u8>,
 
         /// Toggle stereo link for a bank pair (e.g. analog:1-2:on, adat:3-4:off)
@@ -129,15 +129,17 @@ enum Commands {
         #[arg(long)]
         phones_mono: Option<String>,
 
-        /// Set Direct/Computer Mix balance (0.0 = Direct Cue .. 1.0 = Computer USB)
+        /// Set simulator Direct/Computer Mix balance (0.0 = Direct Cue .. 1.0 = Computer USB)
         #[arg(long)]
         mix_balance: Option<f32>,
 
         /// Set Master Cue Output level in dB (-61.0 to 0.0)
         #[arg(long)]
         master_level: Option<f32>,
+        /// Simulator master mute (on/off)
         #[arg(long)]
         master_mute: Option<String>,
+        /// Simulator master solo (on/off)
         #[arg(long)]
         master_solo: Option<String>,
 
@@ -207,13 +209,13 @@ enum Commands {
         interval_ms: u64,
     },
 
-    /// Hardware preset slot management and local JSON preset import/export
+    /// Simulator slot management and local JSON preset import/export
     Preset {
         #[command(subcommand)]
         action: PresetCommand,
     },
 
-    /// Inspect .af8pre firmware archives and query USB DFU Interface 3 status
+    /// Inspect offline .af8pre archives; runtime hardware DFU is disabled
     Firmware {
         #[command(subcommand)]
         action: FirmwareCommand,
@@ -222,14 +224,14 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum PresetCommand {
-    /// Save current state to a hardware preset slot (0..=7) via PresetSave (0x49)
+    /// Save current state to a simulator preset slot (0..=7)
     Save {
-        /// Hardware slot index (0..=7)
+        /// Simulator slot index (0..=7)
         slot: u8,
     },
-    /// Load state from a hardware preset slot (0..=7) via PresetLoad (0x48)
+    /// Load state from a simulator preset slot (0..=7)
     Load {
-        /// Hardware slot index (0..=7)
+        /// Simulator slot index (0..=7)
         slot: u8,
     },
     /// Export current state to a local JSON preset file
@@ -302,7 +304,7 @@ fn main() -> Result<()> {
                     "backend": ctrl.backend_name(),
                     "hardware_detected": ctrl.is_hardware_detected(),
                     "discovery": ctrl.discovery_info(),
-                    "state": ctrl.state(),
+                    "state": status_state_json(ctrl.state(), ctrl.is_simulated()),
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
@@ -422,7 +424,7 @@ fn main() -> Result<()> {
                 }
                 let idx = (ch - 1) as usize;
                 if let Some(grp) = group {
-                    ctrl.set_mixer_channel_group(idx, grp);
+                    ctrl.set_mixer_channel_group(idx, grp)?;
                 }
                 if let Some(lvl) = level {
                     ctrl.set_mixer_channel_level_db(idx, lvl)?;
@@ -562,7 +564,7 @@ fn main() -> Result<()> {
             }
             if cli.json {
                 let payload = serde_json::json!({
-                    "monitor": ctrl.state().monitor,
+                    "monitor": monitor_json(&ctrl.state().monitor, ctrl.is_simulated()),
                     "routing": ctrl.state().routing,
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -589,21 +591,7 @@ fn main() -> Result<()> {
                 ctrl.set_sample_rate(sr)?;
             }
             if cli.json {
-                let cfg = &ctrl.state().config;
-                let payload = serde_json::json!({
-                    "clock_source": cfg.clock_source,
-                    "uac2_selector_entity": 40,
-                    "uac2_clock_entity": cfg.clock_source.uac2_clock_entity(),
-                    "clock_locked": cfg.clock_locked,
-                    "clock_validity": {
-                        "internal_41": cfg.clock_validity[0],
-                        "wordclock_43": cfg.clock_validity[2],
-                        "adat_44": cfg.clock_validity[1],
-                    },
-                    "sample_rate_hz": cfg.sample_rate.to_hz(),
-                    "sample_rate_label": cfg.sample_rate.khz_label(),
-                });
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                println!("{}", serde_json::to_string_pretty(&clock_json(&ctrl))?);
             } else {
                 print_clock(&ctrl);
             }
@@ -712,12 +700,12 @@ fn main() -> Result<()> {
                         serde_json::to_string_pretty(&serde_json::json!({
                             "action": "preset_save",
                             "slot": slot,
-                            "request_code": "0x49",
+                            "backend": "simulator",
                             "status": "ok"
                         }))?
                     );
                 } else {
-                    println!("Saved hardware preset to slot {} (PresetSave 0x49).", slot);
+                    println!("Saved simulator preset to slot {}.", slot);
                 }
             }
             PresetCommand::Load { slot } => {
@@ -728,15 +716,12 @@ fn main() -> Result<()> {
                         serde_json::to_string_pretty(&serde_json::json!({
                             "action": "preset_load",
                             "slot": slot,
-                            "request_code": "0x48",
+                            "backend": "simulator",
                             "status": "ok"
                         }))?
                     );
                 } else {
-                    println!(
-                        "Loaded hardware preset from slot {} (PresetLoad 0x48).",
-                        slot
-                    );
+                    println!("Loaded simulator preset from slot {}.", slot);
                 }
             }
             PresetCommand::Export {
@@ -758,16 +743,23 @@ fn main() -> Result<()> {
                 }
             }
             PresetCommand::Import { path } => {
-                let preset = ctrl
+                let (preset, report) = ctrl
                     .import_preset_file(&path)
                     .with_context(|| format!("Failed to import preset from {}", path.display()))?;
                 if cli.json {
-                    println!("{}", serde_json::to_string_pretty(&preset)?);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({"preset":preset,"report":report})
+                        )?
+                    );
                 } else {
                     println!(
-                        "Imported and applied preset '{}' from {}",
+                        "Imported and applied preset '{}' from {} ({} applied; skipped: {})",
                         preset.preset_name,
-                        path.display()
+                        path.display(),
+                        report.applied.len(),
+                        report.skipped_summary()
                     );
                 }
             }
@@ -872,6 +864,26 @@ fn print_status(ctrl: &AudioFuseController) {
     print_routing(ctrl);
 }
 
+fn clock_json(ctrl: &AudioFuseController) -> serde_json::Value {
+    let cfg = &ctrl.state().config;
+    let read_only = ctrl.sample_rate_read_only_reason();
+    serde_json::json!({
+        "clock_source": cfg.clock_source,
+        "uac2_selector_entity": 40,
+        "uac2_clock_entity": cfg.clock_source.uac2_clock_entity(),
+        "clock_locked": cfg.clock_locked,
+        "clock_validity": {
+            "internal_41": cfg.clock_validity[0],
+            "wordclock_43": cfg.clock_validity[2],
+            "adat_44": cfg.clock_validity[1],
+        },
+        "sample_rate_hz": cfg.sample_rate.to_hz(),
+        "sample_rate_label": cfg.sample_rate.khz_label(),
+        "sample_rate_writable": read_only.is_none(),
+        "sample_rate_read_only_reason": read_only,
+    })
+}
+
 fn print_clock(ctrl: &AudioFuseController) {
     let cfg = &ctrl.state().config;
     println!("--- CLOCK & SAMPLE RATE (UAC2 Entities 40, 41, 43, 44) ---");
@@ -891,7 +903,13 @@ fn print_clock(ctrl: &AudioFuseController) {
         if cfg.clock_validity[2] { "VALID" } else { "NO" },
         if cfg.clock_validity[1] { "VALID" } else { "NO" }
     );
-    println!("Sample Rate     : {}", cfg.sample_rate);
+    match ctrl.sample_rate_read_only_reason() {
+        Some(reason) => println!(
+            "Sample Rate     : {} (read-only: {reason})",
+            cfg.sample_rate
+        ),
+        None => println!("Sample Rate     : {}", cfg.sample_rate),
+    }
 }
 
 fn print_prefs(ctrl: &AudioFuseController) {
@@ -1068,6 +1086,86 @@ fn print_meters(ctrl: &AudioFuseController, vu_152: &[u8], include_hex: bool) {
                 print!("{:02x} ", b);
             }
             println!();
+        }
+    }
+}
+
+fn status_state_json(state: &audiofuse_core::AudioFuseState, simulated: bool) -> serde_json::Value {
+    let mut value = serde_json::json!(state);
+    if !simulated {
+        value["monitor"] = monitor_json(&state.monitor, false);
+        for channel in value["mixer_channels"]
+            .as_array_mut()
+            .expect("serialized channel list")
+        {
+            channel["name_scope"] = "host-local".into();
+        }
+    }
+    value
+}
+
+fn monitor_json(
+    monitor: &audiofuse_core::MasterMonitorSection,
+    simulated: bool,
+) -> serde_json::Value {
+    let mut value = serde_json::json!(monitor);
+    if !simulated {
+        for key in [
+            "direct_computer_mix",
+            "mixer_output_mute",
+            "mixer_output_solo",
+        ] {
+            value[key] = serde_json::Value::Null;
+        }
+    }
+    value
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn status_marks_host_and_simulator_fields() {
+        let state = audiofuse_core::AudioFuseState::default();
+        let live = status_state_json(&state, false);
+        assert_eq!(live["monitor"], monitor_json(&state.monitor, false));
+        assert!(
+            live["mixer_channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["name_scope"] == "host-local")
+        );
+        assert_eq!(status_state_json(&state, true), serde_json::json!(state));
+    }
+    #[test]
+    fn clock_reports_read_only_rate_plainly() {
+        let sim = std::sync::Arc::new(audiofuse_core::SimulatedTransport::default());
+        let mut ctrl = AudioFuseController::new(sim.clone()).unwrap();
+        assert_eq!(clock_json(&ctrl)["sample_rate_writable"], true);
+        assert!(clock_json(&ctrl)["sample_rate_read_only_reason"].is_null());
+        sim.set_sample_rate_read_only(Some(audiofuse_core::SAMPLE_RATE_READ_ONLY_REASON.into()));
+        let json = clock_json(&ctrl);
+        assert_eq!(json["sample_rate_writable"], false);
+        assert_eq!(
+            json["sample_rate_read_only_reason"],
+            audiofuse_core::SAMPLE_RATE_READ_ONLY_REASON
+        );
+        let error = ctrl
+            .set_sample_rate(SampleRate::Rate96000)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, audiofuse_core::SAMPLE_RATE_READ_ONLY_REASON);
+    }
+    #[test]
+    fn live_master_capabilities_are_explicit() {
+        let monitor = audiofuse_core::AudioFuseState::default().monitor;
+        for key in [
+            "direct_computer_mix",
+            "mixer_output_mute",
+            "mixer_output_solo",
+        ] {
+            assert!(monitor_json(&monitor, false)[key].is_null());
+            assert!(!monitor_json(&monitor, true)[key].is_null());
         }
     }
 }

@@ -23,6 +23,8 @@ pub const KERNEL_CTL_DEVICE_PATH: &str = "/dev/audiofuse8pre-ctl";
 
 #[derive(Debug, Error)]
 pub enum TransportError {
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("USB error: {0}")]
     Usb(#[from] rusb::Error),
     #[error("Arturia AudioFuse 8Pre (1c75:af0e) not found on USB bus")]
@@ -41,8 +43,35 @@ pub enum TransportError {
     Unsupported(String),
     #[error("Hardware rejected or gated change: {0}")]
     HardwareRejected(String),
+    #[error("Preset stopped at {failed}: {cause}; applied {applied:?}; skipped {skipped:?}")]
+    Partial {
+        applied: Vec<String>,
+        skipped: Vec<String>,
+        failed: String,
+        cause: Box<TransportError>,
+    },
+    /// A control the current user cannot change on this backend (plain-language reason).
+    #[error("{0}")]
+    ReadOnly(String),
     #[error("Transport error: {0}")]
     Other(String),
+}
+
+/// Plain explanation shown when the helper bridge refuses sample-rate OUT for this user.
+pub const SAMPLE_RATE_READ_ONLY_REASON: &str =
+    "Sample rate is set by your audio server (PipeWire/JACK) or requires root";
+
+/// `CAP_SYS_ADMIN` bit number (`linux/capability.h`).
+const CAP_SYS_ADMIN_BIT: u32 = 21;
+
+/// Return whether a `/proc/<pid>/status` text grants `CAP_SYS_ADMIN` in `CapEff`,
+/// the capability the helper bridge checks before clock/rate OUT transfers.
+pub fn status_has_cap_sys_admin(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        .is_some_and(|caps| caps & (1u64 << CAP_SYS_ADMIN_BIT) != 0)
 }
 
 /// Discovered USB & ALSA status of the Arturia AudioFuse 8Pre (`1c75:af0e`) on the Linux host.
@@ -92,7 +121,7 @@ impl Default for HardwareDiscoveryInfo {
     }
 }
 
-/// Non-destructively scan Linux `/sys/bus/usb/devices`, `/proc/asound/A8Pre/stream0`,
+/// Non-destructively scan Linux `/sys/bus/usb/devices`, `/proc/asound/cardN/stream0`,
 /// `/dev/audiofuse8pre-ctl`, and `amixer` for an attached Arturia AudioFuse 8Pre (`1c75:af0e`).
 pub fn probe_linux_host_hardware() -> HardwareDiscoveryInfo {
     let mut info = HardwareDiscoveryInfo::default();
@@ -160,10 +189,9 @@ pub fn probe_linux_host_hardware() -> HardwareDiscoveryInfo {
         }
     }
 
-    // 2. Check `/proc/asound/A8Pre/stream0` for active ALSA card & sample rate
-    let stream0_path = Path::new("/proc/asound/A8Pre/stream0");
-    if stream0_path.exists() {
-        info.alsa_card_id = Some("A8Pre".to_string());
+    info.alsa_card_id = alsa_card_for_device(info.bus_number, info.device_address);
+    if let Some(card) = &info.alsa_card_id {
+        let stream0_path = Path::new("/proc/asound").join(card).join("stream0");
         if let Ok(stream_txt) = fs::read_to_string(stream0_path) {
             for line in stream_txt.lines() {
                 let trimmed = line.trim();
@@ -178,10 +206,10 @@ pub fn probe_linux_host_hardware() -> HardwareDiscoveryInfo {
         }
     }
 
-    // 3. Query ALSA UAC2 clock controls (`numid=1..4`) if card `A8Pre` is present
-    if info.alsa_card_id.is_some() {
+    // Query named ALSA clock controls on the matched USB card.
+    if let Some(card) = &info.alsa_card_id {
         match Command::new("amixer")
-            .args(["-c", "A8Pre", "contents"])
+            .args(["-c", card, "contents"])
             .output()
         {
             Ok(output) if output.status.success() && output.stderr.is_empty() => {
@@ -222,32 +250,62 @@ pub fn probe_linux_host_hardware() -> HardwareDiscoveryInfo {
     info
 }
 
-/// Parse `amixer -c A8Pre contents` output for clock validity (`numid=1..3`) and selector (`numid=4`).
+fn alsa_card_for_device(bus: u8, address: u8) -> Option<String> {
+    let usb_path = format!("{bus:03}/{address:03}");
+    fs::read_dir("/proc/asound")
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let path = entry.path();
+            if !entry.file_name().to_string_lossy().starts_with("card")
+                || fs::read_to_string(path.join("usbbus")).ok()?.trim() != usb_path
+                || fs::read_to_string(path.join("usbid")).ok()?.trim() != "1c75:af0e"
+            {
+                return None;
+            }
+            Some(fs::read_to_string(path.join("id")).ok()?.trim().to_owned())
+        })
+}
+
+const CLOCK_CONTROL: &str = "ARTURIA Clock Selector Clock Source";
+
+fn require_idle_streams(status: &str) -> Result<(), TransportError> {
+    let mut states = status
+        .lines()
+        .filter_map(|s| s.trim().strip_prefix("Status: "));
+    if states.by_ref().take(2).eq(["Stop", "Stop"]) && states.next().is_none() {
+        Ok(())
+    } else {
+        Err(TransportError::HardwareRejected(
+            "Stop ALSA/PipeWire streams before changing sample rate".into(),
+        ))
+    }
+}
+
 pub fn parse_amixer_clock_contents(stdout: &str, info: &mut HardwareDiscoveryInfo) {
-    let mut current_numid: Option<u32> = None;
+    let mut control = "";
     for line in stdout.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("numid=") {
-            current_numid = trimmed
-                .split(',')
-                .next()
-                .and_then(|s| s.strip_prefix("numid="))
-                .and_then(|n| n.parse::<u32>().ok());
+            control = trimmed
+                .split_once("name='")
+                .and_then(|(_, s)| s.strip_suffix("'"))
+                .unwrap_or("");
         } else if let Some(val_str) = trimmed.strip_prefix(": values=") {
-            match current_numid {
-                Some(1) => {
+            match control {
+                "Internal Clock Validity" => {
                     // Internal Clock Validity (Entity 41 / 0x29)
                     info.alsa_clock_validity[0] = val_str.trim() == "on";
                 }
-                Some(2) => {
+                "WORD Clock Validity" => {
                     // WORD Clock Validity (Entity 43 / 0x2B)
                     info.alsa_clock_validity[2] = val_str.trim() == "on";
                 }
-                Some(3) => {
+                "ADAT Clock Validity" => {
                     // ADAT Clock Validity (Entity 44 / 0x2C)
                     info.alsa_clock_validity[1] = val_str.trim() == "on";
                 }
-                Some(4) => {
+                CLOCK_CONTROL => {
                     // ARTURIA Clock Selector Clock Source:
                     // Item #0 'Internal Clock', Item #1 'WORD Clock', Item #2 'ADAT Clock'
                     match val_str.trim() {
@@ -367,7 +425,15 @@ pub trait AudioFuseTransport: Send + Sync {
     fn get_sample_rate(&self) -> Result<SampleRate, TransportError>;
 
     /// Set UAC2 Sample Rate (`CS_SAM_FREQ_CONTROL = 0x01`) on Entity `41` (`0x29`).
+    fn check_rate_change(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
     fn set_sample_rate(&self, rate: SampleRate) -> Result<(), TransportError>;
+
+    /// `Some(reason)` when this user cannot change the sample rate on this backend.
+    fn sample_rate_read_only_reason(&self) -> Option<String> {
+        None
+    }
 
     /// Read USB DFU status (blocked on live hardware to protect audio streaming).
     fn get_dfu_status(&self) -> Result<DfuStatusReport, TransportError>;
@@ -395,6 +461,7 @@ struct SimInner {
     discovery: HardwareDiscoveryInfo,
     tick_counter: u64,
     animate_meters: bool,
+    rate_read_only: Option<String>,
 }
 
 impl Default for SimulatedTransport {
@@ -475,9 +542,15 @@ impl SimulatedTransport {
                 discovery,
                 tick_counter: 0,
                 animate_meters,
+                rate_read_only: None,
             })),
             backend_label,
         }
+    }
+
+    /// Model a live bridge client without the rate privilege (tests only reach this).
+    pub fn set_sample_rate_read_only(&self, reason: Option<String>) {
+        self.inner.lock().unwrap().rate_read_only = reason;
     }
 
     /// Return a snapshot of the simulator's internal `AudioFuseState`.
@@ -692,7 +765,8 @@ impl AudioFuseTransport for SimulatedTransport {
                 guard.state.config.wordclock_thru = value != 0;
             }
             param_id::ANALOG_OUT_SOURCE if idx < 4 => {
-                guard.state.routing.analog_out_sources[idx] = AnalogOutSource::from_wire_mask(value);
+                guard.state.routing.analog_out_sources[idx] =
+                    AnalogOutSource::from_wire_mask(value);
             }
             param_id::ADAT_OUT_SOURCE if idx < 4 => {
                 guard.state.routing.adat_out_sources[idx] = AdatOutSource::from_wire_mask(value);
@@ -778,15 +852,13 @@ impl AudioFuseTransport for SimulatedTransport {
         channel_idx: usize,
         input_type: InputType,
     ) -> Result<(), TransportError> {
-        if channel_idx >= 8 {
-            return Ok(());
+        if channel_idx >= 8 || (input_type == InputType::Inst && channel_idx >= 2) {
+            return Err(TransportError::InvalidArgument(
+                "Invalid input channel for selected mode".into(),
+            ));
         }
         let mut guard = self.inner.lock().unwrap();
-        let it = if channel_idx >= 2 && input_type == InputType::Inst {
-            InputType::Line
-        } else {
-            input_type
-        };
+        let it = input_type;
         let inp = &mut guard.state.inputs[channel_idx];
         inp.input_type = it;
         inp.mic_active = matches!(it, InputType::ComboAuto | InputType::Mic);
@@ -837,7 +909,14 @@ impl AudioFuseTransport for SimulatedTransport {
         Ok(self.inner.lock().unwrap().state.config.sample_rate)
     }
 
+    fn sample_rate_read_only_reason(&self) -> Option<String> {
+        self.inner.lock().unwrap().rate_read_only.clone()
+    }
+
     fn set_sample_rate(&self, rate: SampleRate) -> Result<(), TransportError> {
+        if let Some(reason) = self.sample_rate_read_only_reason() {
+            return Err(TransportError::ReadOnly(reason));
+        }
         self.inner.lock().unwrap().state.config.sample_rate = rate;
         Ok(())
     }
@@ -900,6 +979,15 @@ mod kernel_ctl {
 
     unsafe extern "C" {
         fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    }
+
+    /// Map the bridge's capability refusal (`EACCES`) on the sample-rate entity
+    /// to the plain read-only explanation instead of a raw OS error.
+    pub fn plain_out_refusal(errno: Option<i32>, w_index: u16) -> Option<TransportError> {
+        const EACCES: i32 = 13;
+        (errno == Some(EACCES)
+            && w_index == encode_unit_windex(UAC2_ENTITY_CLOCK_INTERNAL, UAC2_CONTROL_INTERFACE))
+        .then(|| TransportError::ReadOnly(SAMPLE_RATE_READ_ONLY_REASON.into()))
     }
 
     pub struct KernelCtlBridge {
@@ -1014,6 +1102,9 @@ mod kernel_ctl {
             let ret = unsafe { ioctl(self.file.as_raw_fd(), AF8PRE_IOCTL_CTRL_TRANSFER, &mut req) };
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
+                if let Some(plain) = plain_out_refusal(err.raw_os_error(), w_index) {
+                    return Err(plain);
+                }
                 return Err(TransportError::Other(format!(
                     "EP0 OUT failed (req=0x{b_request:02x} val=0x{w_value:04x} idx=0x{w_index:04x}): {err}"
                 )));
@@ -1082,7 +1173,7 @@ impl UsbHardwareTransport {
         if let Some(driver) = &discovery.control_driver {
             return Err(TransportError::Other(format!(
                 "AudioControl interface 0 is owned by {driver} and {KERNEL_CTL_DEVICE_PATH} is not loaded. \
-                 Build and load the non-intrusive EP0 helper (`make -C kmod && sudo insmod kmod/audiofuse8pre_ctl.ko`) \
+                 Build and load the non-intrusive EP0 helper (`sudo dkms install audiofuse8pre-ctl/0.2.1 && sudo modprobe audiofuse8pre_ctl`) \
                  for live hardware control alongside ALSA/PipeWire, or pass --simulator for offline mode."
             )));
         }
@@ -1093,7 +1184,7 @@ impl UsbHardwareTransport {
             .claim_interface(UAC2_CONTROL_INTERFACE)
             .map_err(|e| {
                 TransportError::Other(format!(
-                    "Cannot claim AudioControl interface 0: {e}. Leave the ALSA driver attached and load kmod/audiofuse8pre_ctl.ko, or use --simulator."
+                    "Cannot claim AudioControl interface 0: {e}. Leave the ALSA driver attached and load audiofuse8pre_ctl with modprobe, or use --simulator."
                 ))
             })?;
         Ok(Self {
@@ -1101,6 +1192,16 @@ impl UsbHardwareTransport {
             backend_label: "Native USB/UAC2 Hardware (rusb IF0, 1c75:af0e)".to_string(),
             discovery,
         })
+    }
+
+    fn bound_alsa_card(&self) -> Result<Option<String>, TransportError> {
+        let card = alsa_card_for_device(self.discovery.bus_number, self.discovery.device_address);
+        if card.is_none() && matches!(self.backend, UsbBackend::KernelBridge(_)) {
+            return Err(TransportError::Other(
+                "Cannot resolve ALSA card for this USB device".into(),
+            ));
+        }
+        Ok(card)
     }
 
     fn open_rusb_handle() -> Result<rusb::DeviceHandle<rusb::GlobalContext>, TransportError> {
@@ -1284,17 +1385,23 @@ impl AudioFuseTransport for UsbHardwareTransport {
     }
 
     fn set_clock_source(&self, source: ClockSource) -> Result<(), TransportError> {
-        // When `snd-usb-audio` owns the card, update via ALSA mixer control `numid=4` so
+        // When `snd-usb-audio` owns the card, update via the named ALSA mixer control so
         // ALSA's internal clock cache stays completely synchronized with the hardware.
-        if let Some(card) = &self.discovery.alsa_card_id {
+        if let Some(card) = self.bound_alsa_card()? {
             let idx_str = source.to_alsa_enum_index().to_string();
             let output = Command::new("amixer")
-                .args(["-c", card, "cset", "numid=4", &idx_str])
+                .args([
+                    "-c",
+                    &card,
+                    "cset",
+                    &format!("iface=MIXER,name={CLOCK_CONTROL}"),
+                    &idx_str,
+                ])
                 .output()
                 .map_err(|e| TransportError::Other(format!("amixer clock cset failed: {e}")))?;
             if !output.status.success() {
                 return Err(TransportError::Other(format!(
-                    "amixer -c {card} cset numid=4 {idx_str} failed: {}",
+                    "amixer -c {card} cset {CLOCK_CONTROL} {idx_str} failed: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
                 )));
             }
@@ -1338,7 +1445,33 @@ impl AudioFuseTransport for UsbHardwareTransport {
         SampleRate::from_hz(hz).ok_or(TransportError::UnsupportedSampleRate(hz))
     }
 
+    fn check_rate_change(&self) -> Result<(), TransportError> {
+        if let Some(card) = self.bound_alsa_card()? {
+            let status = fs::read_to_string(Path::new("/proc/asound").join(card).join("stream0"))
+                .map_err(|e| {
+                TransportError::Other(format!("Cannot inspect ALSA stream state: {e}"))
+            })?;
+            require_idle_streams(&status)?;
+        }
+        Ok(())
+    }
+
+    fn sample_rate_read_only_reason(&self) -> Option<String> {
+        match self.backend {
+            #[cfg(target_os = "linux")]
+            UsbBackend::KernelBridge(_) => {
+                let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+                (!status_has_cap_sys_admin(&status)).then(|| SAMPLE_RATE_READ_ONLY_REASON.into())
+            }
+            UsbBackend::Rusb(_) => None,
+        }
+    }
+
     fn set_sample_rate(&self, rate: SampleRate) -> Result<(), TransportError> {
+        if let Some(reason) = self.sample_rate_read_only_reason() {
+            return Err(TransportError::ReadOnly(reason));
+        }
+        self.check_rate_change()?;
         let target_hz = rate.to_hz();
         self.ctrl_out_exact(
             UAC2_REQ_CUR,
@@ -1390,4 +1523,52 @@ pub fn open_best_available_transport(
         }
     }
     Ok(Arc::new(SimulatedTransport::default()))
+}
+
+#[cfg(test)]
+mod clock_policy_tests {
+    use super::*;
+    #[test]
+    fn stream_guard_fails_closed() {
+        for states in [
+            "",
+            "Status: Stop",
+            "Status: Stop\nStatus: Running",
+            "Status: Unknown",
+        ] {
+            assert!(require_idle_streams(states).is_err());
+        }
+        assert!(require_idle_streams("Status: Stop\nStatus: Stop").is_ok());
+    }
+    #[test]
+    fn clock_controls_survive_renumbering() {
+        let mut info = HardwareDiscoveryInfo::default();
+        parse_amixer_clock_contents(
+            "numid=92,iface=CARD,name='ADAT Clock Validity'\n : values=on",
+            &mut info,
+        );
+        assert!(info.alsa_clock_validity[1]);
+    }
+    #[test]
+    fn rate_privilege_follows_cap_sys_admin() {
+        assert!(status_has_cap_sys_admin(
+            "Name:\tx\nCapEff:\t000001ffffffffff\n"
+        ));
+        assert!(!status_has_cap_sys_admin(
+            "Name:\tx\nCapEff:\t0000000000000000\n"
+        ));
+        assert!(!status_has_cap_sys_admin(
+            "CapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff"
+        ));
+        assert!(!status_has_cap_sys_admin(""));
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bridge_rate_eacces_is_plain() {
+        let err = kernel_ctl::plain_out_refusal(Some(13), 0x2900).unwrap();
+        assert_eq!(err.to_string(), SAMPLE_RATE_READ_ONLY_REASON);
+        assert!(!err.to_string().contains("os error"));
+        assert!(kernel_ctl::plain_out_refusal(Some(13), 0x0a00).is_none());
+        assert!(kernel_ctl::plain_out_refusal(Some(32), 0x2900).is_none());
+    }
 }

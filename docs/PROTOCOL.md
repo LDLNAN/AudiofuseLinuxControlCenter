@@ -112,13 +112,15 @@ Output meters (`Speakers`, `Phones`, `Analog Out 1-8`, `ADAT Out 1-8`, `Loopback
 
 ### 2.4 UAC2 Clock Requests (Interface 0, `bRequest = 0x01` `CUR`)
 
-- **Clock Selector (`Entity 40` / `0x28`)**: `wValue = 0x0100`, `wIndex = 0x2800`, `wLength = 1` (`1 = Internal`, `2 = WORD Clock`, `3 = ADAT Clock`). When `snd-usb-audio` is active, prefer syncing clock source via ALSA `amixer -c A8Pre cset numid=4 <0|1|2>` so ALSA's cached control state stays consistent.
+- **Clock Selector (`Entity 40` / `0x28`)**: `wValue = 0x0100`, `wIndex = 0x2800`, `wLength = 1` (`1 = Internal`, `2 = WORD Clock`, `3 = ADAT Clock`). When `snd-usb-audio` is active, prefer syncing clock source via ALSA the named ALSA mixer control `ARTURIA Clock Selector Clock Source` on the card matched by USB bus and device address so ALSA's cached control state stays consistent.
 - **Clock Validity (`Entities 41/43/44`)**: `wValue = 0x0200`, `wIndex = (entity << 8) | 0x00`, `wLength = 1` (`0 = invalid`, `1 = valid`).
 - **Sample Rate (`Entity 41` / `0x29`)**: `wValue = 0x0100`, `wIndex = 0x2900`, `wLength = 4` (`u32` LE Hz: `44100`, `48000`, `88200`, `96000`). Note: changing sample rate while PipeWire/ALSA streams are open may be rejected or overridden by the audio server's active clock rate.
 
 ---
 
 ## 3. Complete Verified Parameter & 266-Byte State Table
+
+Prior live reads established the snapshot header, size and decoded controls. The retained decoder uses `0x04` for per-input mic pad, `0x0d` for the Hi-Z bitmask, `0x14` for read-only front sense and `0x71` for Word Clock Thru. The state snapshot itself uses **entity** `0x0d`. A snapshot with inactive flags cannot independently establish write semantics. The host overview and groups are local, numbered preset slots and master balance/mute/solo are simulator-only, and firmware inspection is offline.
 
 Every `param_id` corresponds to offset `param_id * 2` in the 266-byte snapshot from Unit `0x0d`:
 
@@ -201,6 +203,8 @@ To preserve **100% uninterrupted ALSA/PipeWire audio**:
 
 - `kmod/audiofuse8pre_ctl.c` provides a minimal, non-intrusive kernel misc device (`/dev/audiofuse8pre-ctl`) that:
   - **NEVER** registers a `usb_driver`, **NEVER** claims or detaches any USB interface, and **NEVER** interferes with `snd-usb-audio` or Interfaces 1 & 2.
-  - Strictly enforces a hardware safety whitelist: **VID `0x1c75` / PID `0xaf0e`**, **Interface `0x00` only** (`(wIndex & 0xff) == 0`), **`bmRequestType` in `{0xa1, 0x21}`**, **`bRequest` in `{0x01, 0x02, 0x03}`**, and **`entity_id` in `{0x0a, 0x0d, 0x11, 0x1e, 0x28, 0x29, 0x2b, 0x2c}`** — hard-blocking Interfaces 1, 2, and 3 (DFU) inside the kernel.
+  - Strictly enforces a hardware safety whitelist: **VID `0x1c75` / PID `0xaf0e`**, **Interface `0x00` only** (`(wIndex & 0xff) == 0`), **`bmRequestType` in `{0xa1, 0x21}`**, **`bRequest` in `{0x01, 0x03}`**, and **`entity_id` in `{0x0a, 0x0d, 0x11, 0x28, 0x29, 0x2b, 0x2c}`** — hard-blocking Interfaces 1, 2, and 3 (DFU) inside the kernel.
   - Dispatches whitelisted EP0 control transfers safely via `usb_control_msg()` under a module mutex while PipeWire/ALSA streaming continues uninterrupted on Interfaces 1 & 2.
-- `UsbHardwareTransport::open()` automatically opens `/dev/audiofuse8pre-ctl` first whenever available; if `/dev/audiofuse8pre-ctl` is absent and Interface 0 is unclaimed, it falls back to `rusb`; if `snd-usb-audio` owns Interface 0 and the helper module is not loaded, it returns a clear, actionable error explaining how to load `kmod/audiofuse8pre_ctl.ko` (or pass `--simulator`).
+- `UsbHardwareTransport::open()` automatically opens `/dev/audiofuse8pre-ctl` first whenever available; if `/dev/audiofuse8pre-ctl` is absent and Interface 0 is unclaimed, it falls back to `rusb`; if `snd-usb-audio` owns Interface 0 and the helper module is not loaded, it returns a clear, actionable error with the packaged recovery command `sudo dkms install audiofuse8pre-ctl/0.2.1 && sudo modprobe audiofuse8pre_ctl` (or pass `--simulator`). Native packages run `/usr/lib/audiofuse-control-center/audiofuse8pre-dkms install`, which builds the running kernel first and only warns when another kernel's build fails or the kernel refuses to load the module (for example Secure Boot without an enrolled MOK key), so package configuration still completes.
+
+The bridge checks the calling task's CAP_SYS_ADMIN for clock selector and sample-rate OUT transfers, in addition to write access. Normal clock selection uses the named ALSA control. An unprivileged bridge client can read the rate and must use its audio server to request a different rate. The GUI shows the rate buttons disabled under `SAMPLE RATE (ENTITY 41) · READ-ONLY` with the plain reason "Sample rate is set by your audio server (PipeWire/JACK) or requires root". `audiofuse-cli clock --rate` exits 1 with the same sentence, and `clock --json` reports `sample_rate_writable: false` and `sample_rate_read_only_reason`. A bridge `EACCES` on entity `0x29` maps to the same sentence instead of a raw OS error. The usbfs node grants the audio group and active seat access (0660 plus uaccess) for the direct rusb fallback. Those principals also have independent usbfs access. The bridge policy guards its own callers against application errors.

@@ -544,15 +544,9 @@ impl AudioFuseState {
                     };
                 }
                 _ => {
-                    if inp.inst_hi_z {
-                        inp.mic_active = false;
-                        inp.jack_active = true;
-                        inp.input_type = InputType::Inst;
-                    } else {
-                        inp.mic_active = false;
-                        inp.jack_active = false;
-                        inp.input_type = InputType::ComboAuto;
-                    }
+                    inp.mic_active = false;
+                    inp.jack_active = false;
+                    inp.input_type = InputType::ComboAuto;
                 }
             }
         }
@@ -596,7 +590,8 @@ impl AudioFuseState {
         let stereo_mask = read_u16(param_id::MIXER_STEREO_SHOW);
         for bank in 0..3 {
             for pair in 0..4 {
-                self.stereo_links[bank].set_pair(pair, ((stereo_mask >> (bank * 4 + pair)) & 1) != 0);
+                self.stereo_links[bank]
+                    .set_pair(pair, ((stereo_mask >> (bank * 4 + pair)) & 1) != 0);
             }
         }
 
@@ -660,12 +655,8 @@ impl AudioFuseState {
     pub fn apply_afex_vu_152(&mut self, buf: &[u8; AFEX_VU_SIZE]) {
         let mut vu = [0u8; AFEX_VU_CHANNELS];
         for i in 0..AFEX_VU_CHANNELS {
-            let raw = i32::from_le_bytes([
-                buf[i * 4],
-                buf[i * 4 + 1],
-                buf[i * 4 + 2],
-                buf[i * 4 + 3],
-            ]);
+            let raw =
+                i32::from_le_bytes([buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2], buf[i * 4 + 3]]);
             vu[i] = vu_i32_to_u8(raw);
         }
 

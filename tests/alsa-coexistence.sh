@@ -5,13 +5,26 @@ set -euo pipefail
 cli=${AUDIOFUSE_CLI:-target/release/audiofuse-cli}
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/audiofuse-coexistence.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
+cards=()
+for idfile in /proc/asound/card[0-9]*/usbid; do
+    [[ -r "$idfile" && $(<"$idfile") == 1c75:af0e ]] && cards+=("${idfile%/usbid}")
+done
+if (( ${#cards[@]} != 1 )); then
+    echo "Expected one attached AudioFuse 8Pre ALSA card" >&2
+    exit 1
+fi
+card=$(<"${cards[0]}/id")
 snapshot() {
     local out=$1 node found=0
     mkdir -p "$out"
-    amixer -c A8Pre contents > "$out/controls" 2>"$out/amixer-errors"
+    amixer -c "$card" contents > "$out/controls" 2>"$out/amixer-errors"
     test ! -s "$out/amixer-errors"
-    awk '/Status:|Interface =|Altset =|Momentary freq =/{print}' /proc/asound/A8Pre/stream0 > "$out/streams"
-    test "$(grep -c 'Status: Running' "$out/streams")" -eq 2
+    awk '/Status:|Interface =|Altset =|Momentary freq =/{print}' "${cards[0]}/stream0" > "$out/streams"
+    if [[ $(grep -c 'Status: Running' "$out/streams") != 2 ]]; then
+        echo "Coexistence requires active playback and capture. Observed:" >&2
+        cat "$out/streams" >&2
+        return 1
+    fi
     for node in /sys/bus/usb/devices/*; do
         [[ -r "$node/idVendor" && -r "$node/idProduct" ]] || continue
         [[ $(<"$node/idVendor") == 1c75 && $(<"$node/idProduct") == af0e ]] || continue

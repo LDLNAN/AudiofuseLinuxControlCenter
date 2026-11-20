@@ -32,8 +32,8 @@ impl StudioThemeMode {
 
     pub fn label(&self) -> &'static str {
         match self {
-            Self::DarkCarbon => "DARK (#141413)",
-            Self::LightPaper => "LIGHT (#F6F5F2)",
+            Self::DarkCarbon => "DARK",
+            Self::LightPaper => "LIGHT",
         }
     }
 }

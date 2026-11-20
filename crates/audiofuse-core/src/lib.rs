@@ -21,8 +21,8 @@ pub use state::{
     MasterMonitorSection, RoutingMatrix,
 };
 pub use transport::{
-    AudioFuseTransport, HardwareDiscoveryInfo, SimulatedTransport, TransportError,
-    UsbHardwareTransport, open_best_available_transport, probe_linux_host_hardware,
+    AudioFuseTransport, HardwareDiscoveryInfo, SAMPLE_RATE_READ_ONLY_REASON, SimulatedTransport,
+    TransportError, UsbHardwareTransport, open_best_available_transport, probe_linux_host_hardware,
 };
 
 #[cfg(test)]
@@ -117,9 +117,12 @@ mod tests {
         assert_eq!(ctrl.state().inputs[0].input_type, InputType::Inst);
         assert_eq!(sim.get_parameter(param_id::INPUT_INST, 0).unwrap(), 1);
 
-        // Channels 3..8 reject Inst Hi-Z and clamp to Line in simulator
-        ctrl.set_input_type(2, InputType::Inst).unwrap();
-        assert_eq!(ctrl.state().inputs[2].input_type, InputType::Line);
+        // Channels 3..8 reject Inst Hi-Z and retain their current mode.
+        assert!(matches!(
+            ctrl.set_input_type(2, InputType::Inst),
+            Err(TransportError::InvalidArgument(_))
+        ));
+        assert_eq!(ctrl.state().inputs[2].input_type, InputType::ComboAuto);
         assert!(!ctrl.state().inputs[2].inst_hi_z);
 
         // +48V Phantom power bank 1-4 and 5-8
@@ -197,8 +200,8 @@ mod tests {
         );
 
         // Channel Group 1 across ADAT 1 (idx 8) and USB 1 (idx 16)
-        ctrl.set_mixer_channel_group(8, 1);
-        ctrl.set_mixer_channel_group(16, 1);
+        ctrl.set_mixer_channel_group(8, 1).unwrap();
+        ctrl.set_mixer_channel_group(16, 1).unwrap();
         ctrl.set_mixer_channel_mute(8, true).unwrap();
         assert!(ctrl.state().mixer_channels[8].mute);
         assert!(ctrl.state().mixer_channels[16].mute);
@@ -328,10 +331,7 @@ mod tests {
         assert!((decoded.monitor.mixer_output_level_db - (-6.0)).abs() <= 0.1);
         assert_eq!(decoded.monitor.speakers_source, SpeakersSource::CueMix);
         assert!(decoded.monitor.speakers_mono);
-        assert_eq!(
-            decoded.monitor.phones_source,
-            PhonesSource::FollowSpeakers
-        );
+        assert_eq!(decoded.monitor.phones_source, PhonesSource::FollowSpeakers);
         assert!(decoded.monitor.phones_mono);
         assert_eq!(
             decoded.routing.analog_out_sources[0],
@@ -341,10 +341,7 @@ mod tests {
             decoded.routing.adat_out_sources[1],
             AdatOutSource::AnalogInPair
         );
-        assert_eq!(
-            decoded.routing.loopback_source,
-            LoopbackSource::Usb17_18
-        );
+        assert_eq!(decoded.routing.loopback_source, LoopbackSource::Usb17_18);
 
         // Verify 152-byte live VU packet decoding & routing derivation
         let mut vu_buf = [0u8; AFEX_VU_SIZE];

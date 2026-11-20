@@ -13,18 +13,34 @@ build:
 
 test:
 	cargo test --workspace
+	bash tests/helper-payload.sh
+	bash tests/dkms-hook.sh
+	$(MAKE) -C kmod test-policy
 
 clean:
 	cargo clean
 
-install: build
-	install -Dm755 target/release/audiofuse-control-center $(DESTDIR)$(BINDIR)/audiofuse-control-center
-	install -Dm755 target/release/audiofuse-cli $(DESTDIR)$(BINDIR)/audiofuse-cli
+HELPER_DIR = $(DESTDIR)$(PREFIX)/src/audiofuse8pre-ctl-0.2.1
+HELPER_FILES = kmod/audiofuse8pre_ctl.c kmod/audiofuse8pre_ctl.h kmod/audiofuse8pre_policy.h kmod/Makefile kmod/dkms.conf
+
+.PHONY: install-helper
+install-helper:
+	install -Dm644 packaging/audiofuse8pre-ctl.conf "$(DESTDIR)$(PREFIX)/lib/modules-load.d/audiofuse8pre-ctl.conf"
+	install -Dm755 packaging/audiofuse8pre-dkms "$(DESTDIR)$(PREFIX)/lib/audiofuse-control-center/audiofuse8pre-dkms"
+	install -d "$(HELPER_DIR)"
+	install -m644 $(HELPER_FILES) "$(HELPER_DIR)/"
+
+install: build install-helper
+	install -Dm755 $(or $(CARGO_TARGET_DIR),target)/release/audiofuse-control-center $(DESTDIR)$(BINDIR)/audiofuse-control-center
+	install -Dm755 $(or $(CARGO_TARGET_DIR),target)/release/audiofuse-cli $(DESTDIR)$(BINDIR)/audiofuse-cli
 	install -Dm644 udev/70-arturia-audiofuse.rules $(DESTDIR)$(UDEVDIR)/70-arturia-audiofuse.rules
 	install -Dm644 packaging/audiofuse-control-center.desktop $(DESTDIR)$(APPDIR)/audiofuse-control-center.desktop
 	install -Dm644 packaging/audiofuse-control-center.svg $(DESTDIR)$(ICONDIR)/audiofuse-control-center.svg
 
 uninstall:
+	rm -f "$(DESTDIR)$(PREFIX)/lib/modules-load.d/audiofuse8pre-ctl.conf" "$(DESTDIR)$(PREFIX)/lib/audiofuse-control-center/audiofuse8pre-dkms"
+	rm -f $(addprefix $(HELPER_DIR)/,$(notdir $(HELPER_FILES)))
+	-rmdir "$(HELPER_DIR)"
 	rm -f $(DESTDIR)$(BINDIR)/audiofuse-control-center
 	rm -f $(DESTDIR)$(BINDIR)/audiofuse-cli
 	rm -f $(DESTDIR)$(UDEVDIR)/70-arturia-audiofuse.rules

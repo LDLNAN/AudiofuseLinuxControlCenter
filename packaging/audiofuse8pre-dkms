@@ -1,0 +1,65 @@
+#!/bin/sh
+# Called by native package maintainers after installing sources, or before removal.
+# Helper build/load problems are reported as warnings so the package still
+# configures: the app keeps working in simulator mode and shows the recovery
+# command until the helper is built and loaded.
+set -eu
+module=audiofuse8pre-ctl/0.2.1
+recover="sudo dkms install $module && sudo modprobe audiofuse8pre_ctl"
+# Overridable only so tests/dkms-hook.sh can run against a fake module tree.
+modules=${AUDIOFUSE_MODULES_DIR:-/lib/modules}
+
+warn() {
+    echo "AudioFuse helper: $*" >&2
+}
+
+build_for() {
+    if dkms build --force "$module" -k "$1" && dkms install --force "$module" -k "$1"; then
+        return 0
+    fi
+    warn "build for kernel $1 failed; package installed anyway. Retry with: sudo dkms install $module -k $1"
+    return 1
+}
+
+case "${1:-}" in
+    remove)
+        registered=$(dkms status "$module" 2>/dev/null || true)
+        if [ -n "$registered" ]; then
+            dkms remove "$module" --all || warn "dkms remove failed; remove it manually with: sudo dkms remove $module --all"
+        fi
+        ;;
+    install)
+        registered=$(dkms status "$module" 2>/dev/null || true)
+        if [ -z "$registered" ]; then
+            if ! dkms add "$module"; then
+                warn "dkms add failed; package installed anyway. Run: $recover"
+                exit 0
+            fi
+        fi
+        running=$(uname -r)
+        running_ok=0
+        # Build the running kernel first, so a failure on an older kernel
+        # never blocks the kernel that is in use now.
+        if [ -f "$modules/$running/build/Makefile" ]; then
+            if build_for "$running"; then running_ok=1; fi
+        else
+            warn "registered. Install matching kernel headers to build it for $running, then run: $recover"
+        fi
+        for build in "$modules"/*/build; do
+            [ -f "$build/Makefile" ] || continue
+            kernel=${build%/build}
+            kernel=${kernel##*/}
+            [ "$kernel" = "$running" ] && continue
+            build_for "$kernel" || true
+        done
+        if [ "$running_ok" -eq 1 ] \
+            && ! systemd-detect-virt --quiet --chroot \
+            && ! systemd-detect-virt --quiet --container; then
+            if ! modprobe audiofuse8pre_ctl; then
+                warn "installed but the kernel refused to load it (Secure Boot without an enrolled MOK key?). Enrol the DKMS signing key or run: sudo modprobe audiofuse8pre_ctl"
+            fi
+        fi
+        ;;
+    *) exit 2 ;;
+esac
+exit 0

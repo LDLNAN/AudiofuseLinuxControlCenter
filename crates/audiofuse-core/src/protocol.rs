@@ -440,9 +440,7 @@ pub fn vu_i32_to_u8(raw: i32) -> u8 {
     if dbfs <= -59.9 {
         0
     } else {
-        (((dbfs + 60.0) / 60.0) * 127.0)
-            .round()
-            .clamp(0.0, 127.0) as u8
+        (((dbfs + 60.0) / 60.0) * 127.0).round().clamp(0.0, 127.0) as u8
     }
 }
 
@@ -545,7 +543,7 @@ impl ClockSource {
         }
     }
 
-    /// Convert to ALSA `amixer -c A8Pre cset numid=4 <idx>` enum value (`0 = Internal, 1 = WORD, 2 = ADAT`).
+    /// Convert to the named ALSA clock selector enum value (`0 = Internal, 1 = WORD, 2 = ADAT`).
     pub fn to_alsa_enum_index(&self) -> u8 {
         match self {
             Self::Internal => 0,

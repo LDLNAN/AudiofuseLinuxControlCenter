@@ -22,6 +22,8 @@
 #include <linux/usb.h>
 
 #include "audiofuse8pre_ctl.h"
+#include <linux/capability.h>
+#include "audiofuse8pre_policy.h"
 
 #define AF8PRE_DEVICE_NAME "audiofuse8pre-ctl"
 
@@ -63,43 +65,31 @@ static struct usb_device *af8pre_find_device(u8 bus_num, u8 dev_num)
 	return ctx.udev;
 }
 
-static bool af8pre_request_allowed(const struct af8pre_ctrl_transfer *req)
+static bool af8pre_request_allowed(const struct af8pre_ctrl_transfer *req, bool file_has_write)
 {
-	u8 iface = req->w_index & 0xff;
-	u8 entity = (req->w_index >> 8) & 0xff;
+	bool clock_out = req->bm_request_type == AF8PRE_REQ_OUT &&
+		(req->w_index == 0x2800 || req->w_index == 0x2900);
 
-	/* Only UAC2 / AFEX Class Interface IN (0xa1) or OUT (0x21). */
-	if (req->bm_request_type != 0xa1 && req->bm_request_type != 0x21)
+	if (req->reserved != 0)
 		return false;
 
-	/* Only MEM (0x03), CUR (0x01), or RANGE (0x02). */
-	if (req->b_request != 0x03 && req->b_request != 0x01 && req->b_request != 0x02)
+	if (!af8pre_policy_allows_header(req->bm_request_type,
+					 req->b_request,
+					 req->w_value,
+					 req->w_index,
+					 req->w_length,
+					 file_has_write,
+					 clock_out && capable(CAP_SYS_ADMIN)))
 		return false;
 
-	/*
-	 * HARD SAFETY RULE: Interface 0 (AudioControl) ONLY.
-	 * Never allow Interface 1/2 (AudioStreaming) or Interface 3 (DFU).
-	 */
-	if (iface != 0x00)
-		return false;
-
-	/* Whitelist verified AudioFuse 8Pre AudioControl / AFEX entities. */
-	switch (entity) {
-	case 0x0a: /* AFEX parameter control unit (read/write) */
-	case 0x0d: /* AFEX bulk state snapshot unit (56/204/266 bytes) */
-	case 0x11: /* AFEX live VU meter unit (152 bytes = 38 x i32) */
-	case 0x1e: /* UAC2 Extension Unit 30 */
-	case 0x28: /* UAC2 Clock Selector 40 */
-	case 0x29: /* UAC2 Internal Clock Source 41 */
-	case 0x2b: /* UAC2 WORD Clock Source 43 */
-	case 0x2c: /* UAC2 ADAT Clock Source 44 */
-		break;
-	default:
-		return false;
+	if ((req->bm_request_type & USB_DIR_IN) == 0) {
+		if (!af8pre_policy_allows_out_payload(req->b_request,
+						      req->w_value,
+						      req->w_index,
+						      req->w_length,
+						      req->data))
+			return false;
 	}
-
-	if (req->w_length > AF8PRE_MAX_DATA_LEN)
-		return false;
 
 	return true;
 }
@@ -130,12 +120,13 @@ static long af8pre_ioctl_device_info(unsigned long arg)
 	return 0;
 }
 
-static long af8pre_ioctl_ctrl_transfer(unsigned long arg)
+static long af8pre_ioctl_ctrl_transfer(struct file *filp, unsigned long arg)
 {
 	struct af8pre_ctrl_transfer *req;
 	struct usb_device *udev = NULL;
 	void *kbuf = NULL;
 	unsigned int pipe;
+	bool file_has_write = (filp->f_mode & FMODE_WRITE) != 0;
 	int timeout_ms;
 	int ret;
 
@@ -148,7 +139,7 @@ static long af8pre_ioctl_ctrl_transfer(unsigned long arg)
 		goto out_free_req;
 	}
 
-	if (!af8pre_request_allowed(req)) {
+	if (!af8pre_request_allowed(req, file_has_write)) {
 		ret = -EACCES;
 		goto out_free_req;
 	}
@@ -222,7 +213,7 @@ static long af8pre_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned 
 	case AF8PRE_IOCTL_DEVICE_INFO:
 		return af8pre_ioctl_device_info(arg);
 	case AF8PRE_IOCTL_CTRL_TRANSFER:
-		return af8pre_ioctl_ctrl_transfer(arg);
+		return af8pre_ioctl_ctrl_transfer(filp, arg);
 	default:
 		return -ENOTTY;
 	}
@@ -234,11 +225,15 @@ static const struct file_operations af8pre_fops = {
 	.compat_ioctl = compat_ptr_ioctl,
 };
 
+/*
+ * Restrict default device node mode to 0660 (never world-writable 0666).
+ * Pair with udev/70-arturia-audiofuse.rules (GROUP="audio", TAG+="uaccess").
+ */
 static struct miscdevice af8pre_miscdev = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name = AF8PRE_DEVICE_NAME,
 	.fops = &af8pre_fops,
-	.mode = 0666,
+	.mode = 0660,
 };
 
 static int __init af8pre_ctl_init(void)
@@ -249,7 +244,7 @@ static int __init af8pre_ctl_init(void)
 		pr_err("audiofuse8pre_ctl: misc_register failed: %d\n", ret);
 		return ret;
 	}
-	pr_info("audiofuse8pre_ctl: registered /dev/%s (non-intrusive EP0 bridge for 1c75:af0e)\n",
+	pr_info("audiofuse8pre_ctl: registered /dev/%s (0660, strict EP0 IF0 bridge for 1c75:af0e)\n",
 		AF8PRE_DEVICE_NAME);
 	return 0;
 }
@@ -265,5 +260,5 @@ module_exit(af8pre_ctl_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("AudioFuse Linux Control Center Contributors");
-MODULE_DESCRIPTION("Non-intrusive EP0 control helper for Arturia AudioFuse 8Pre (1c75:af0e)");
-MODULE_VERSION("0.1.0");
+MODULE_DESCRIPTION("Non-intrusive strict EP0 control helper for Arturia AudioFuse 8Pre (1c75:af0e)");
+MODULE_VERSION("0.2.1");

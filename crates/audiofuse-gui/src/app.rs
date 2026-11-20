@@ -4,7 +4,7 @@
 //! Console sections:
 //! - Top Hardware Rack Bar: Device Name, Serial, Firmware/DFU inspector, USB/ADAT Mode,
 //!   Clock Source (`Internal` / `ADAT` / `Word Clock`), Lock Status, Sample Rate (`44.1..96 kHz`),
-//!   Wordclock `75 Ohms` / `Thru`, ADAT & `S/MUX`, Hardware Preset Slots `0..7`, JSON Export/Import,
+//!   Wordclock `75 Ohms` / `Thru`, ADAT & `S/MUX`, Simulator Preset Slots `0..7`, JSON Export/Import,
 //!   and Dark (`#141413`) / Light (`#f6f5f2`) studio theme toggle.
 //! - Upper Console: 8 Analog Input Channel Strips (`Mic`/`Line`/`Inst` Hi-Z on Ch 1-2,
 //!   `+48V` Phantom Power per-channel & banks `1-4`/`5-8`, Phase Invert `Ø`, `-20dB` Line Pad,
@@ -41,10 +41,12 @@ pub struct ControlCenterApp {
     pub firmware_archive_path: String,
     pub inspected_firmware: Option<FirmwareInspection>,
     pub show_firmware_modal: bool,
+    import_result: Option<String>,
     pub status_banner: String,
     meters: std::sync::mpsc::Receiver<Result<TelemetryFrame, audiofuse_core::TransportError>>,
     pub screenshot: Option<PathBuf>,
     page: usize,
+    visible: [bool; 24],
     device_name: String,
     dfu: String,
     frames: u32,
@@ -58,8 +60,18 @@ impl ControlCenterApp {
             Ok(report) => format!("{} • {}", controller.backend_name(), report.state.as_str()),
             Err(error) => format!("DFU status unavailable: {error}"),
         };
-        let status_banner = controller.backend_name().to_string();
+        let mut status_banner = controller.backend_name().to_string();
+        let defaults = std::array::from_fn(|i| controller.state().mixer_channels[i].show);
+        let visible = match visibility_path().and_then(|p| read_visibility(&p)) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => defaults,
+            Err(e) => {
+                status_banner = format!("Overview settings: {e}");
+                defaults
+            }
+        };
         Self {
+            visible,
             controller,
             theme_mode,
             active_bank: MixerBank::Analog,
@@ -68,6 +80,7 @@ impl ControlCenterApp {
             firmware_archive_path: String::new(),
             inspected_firmware: None,
             show_firmware_modal: false,
+            import_result: None,
             status_banner,
             meters,
             frames: 0,
@@ -75,6 +88,30 @@ impl ControlCenterApp {
             page: 0,
             device_name,
             dfu,
+        }
+    }
+
+    fn apply_telemetry(&mut self, update: Result<TelemetryFrame, audiofuse_core::TransportError>) {
+        match update {
+            Ok(frame) => {
+                if self.status_banner.starts_with("Meters stale:") {
+                    self.status_banner = "Meters current".into();
+                }
+                if let Some((source, valid, rate)) = frame.clock {
+                    let config = &mut self.controller.state_mut().config;
+                    config.clock_source = source;
+                    config.clock_validity = valid;
+                    config.clock_locked = valid[source as usize];
+                    config.sample_rate = rate;
+                }
+                if let Some(state_266) = frame.state_266 {
+                    if let Err(e) = self.controller.apply_state_snapshot(&state_266) {
+                        self.status_banner = format!("State decode error: {e}");
+                    }
+                }
+                self.controller.state_mut().apply_afex_vu_152(&frame.vu_152);
+            }
+            Err(e) => self.status_banner = format!("Meters stale: {e}"),
         }
     }
 
@@ -129,7 +166,7 @@ impl ControlCenterApp {
                         let cfg = &self.controller.state().config;
                         ui.label(
                             RichText::new(format!(
-                                "VID:PID {:04X}:{:04X} | SN {} | FW v{} | UNIT 0x0A",
+                                "VID:PID {:04X}:{:04X} | SN {} | FW v{}",
                                 disc.vendor_id,
                                 disc.product_id,
                                 cfg.serial_number,
@@ -185,35 +222,7 @@ impl ControlCenterApp {
                     ui.separator();
 
                     // Sample Rate (44.1 / 48 / 88.2 / 96 kHz)
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("SAMPLE RATE (ENTITY 41)")
-                                .font(FontId::proportional(10.0))
-                                .color(pal.text_muted),
-                        );
-                        ui.horizontal(|ui| {
-                            let cur_sr = self.controller.state().config.sample_rate;
-                            for sr in SampleRate::ALL {
-                                let active = cur_sr == sr;
-                                if studio_toggle_btn(
-                                    ui,
-                                    sr.khz_label(),
-                                    active,
-                                    pal.accent_orange,
-                                    pal,
-                                )
-                                .clicked()
-                                {
-                                    if let Err(error) = self.controller.set_sample_rate(sr) {
-                                        self.status_banner = error.to_string();
-                                        return;
-                                    }
-                                    self.status_banner =
-                                        format!("SET SAMPLE RATE -> {}", sr.khz_label());
-                                }
-                            }
-                        });
-                    });
+                    self.draw_sample_rate_controls(ui, pal);
 
                     ui.separator();
 
@@ -363,7 +372,9 @@ impl ControlCenterApp {
                                     )
                                     .clicked()
                                     {
-                                        if let Err(error) = self.controller.load_hardware_preset(slot) {
+                                        if let Err(error) =
+                                            self.controller.load_hardware_preset(slot)
+                                        {
                                             self.status_banner = error.to_string();
                                             return;
                                         }
@@ -382,6 +393,15 @@ impl ControlCenterApp {
                                 }
                             }
                             if studio_action_btn(ui, "EXPORT JSON", pal).clicked() {
+                                for (channel, show) in self
+                                    .controller
+                                    .state_mut()
+                                    .mixer_channels
+                                    .iter_mut()
+                                    .zip(self.visible)
+                                {
+                                    channel.show = show;
+                                }
                                 match self.controller.export_preset_file(
                                     &self.preset_file_path,
                                     "Studio Session",
@@ -398,14 +418,29 @@ impl ControlCenterApp {
                             }
                             if studio_action_btn(ui, "IMPORT JSON", pal).clicked() {
                                 match self.controller.import_preset_file(&self.preset_file_path) {
-                                    Ok(p) => {
-                                        self.status_banner =
-                                            format!("IMPORTED PRESET '{}'", p.preset_name);
+                                    Ok((p, report)) => {
+                                        self.status_banner = format!(
+                                            "Imported {} ({} applied; skipped: {})",
+                                            p.preset_name,
+                                            report.applied.len(),
+                                            report.skipped_summary()
+                                        );
+                                        let visible =
+                                            std::array::from_fn(|i| p.state.mixer_channels[i].show);
+                                        match visibility_path()
+                                            .and_then(|path| save_visibility(&path, &visible))
+                                        {
+                                            Ok(()) => self.visible = visible,
+                                            Err(e) => self
+                                                .status_banner
+                                                .push_str(&format!("; overview save failed: {e}")),
+                                        }
                                     }
                                     Err(e) => {
                                         self.status_banner = format!("IMPORT ERROR: {}", e);
                                     }
                                 }
+                                self.import_result = Some(self.status_banner.clone());
                             }
                             if studio_toggle_btn(
                                 ui,
@@ -418,13 +453,66 @@ impl ControlCenterApp {
                             {
                                 self.show_firmware_modal = !self.show_firmware_modal;
                             }
-                            if studio_action_btn(ui, self.theme_mode.label(), pal).clicked() {
-                                self.theme_mode.toggle();
-                            }
                         });
+                        if let Some(result) = &self.import_result {
+                            ui.label(result);
+                        }
                     });
                 });
             });
+    }
+
+    /// Sample-rate selector. When the live bridge refuses rate changes for this user,
+    /// the buttons become a read-only indicator with a plain explanation.
+    fn draw_sample_rate_controls(
+        &mut self,
+        ui: &mut Ui,
+        pal: &StudioPalette,
+    ) -> Vec<egui::Response> {
+        let read_only = self.controller.sample_rate_read_only_reason();
+        let mut buttons = Vec::with_capacity(SampleRate::ALL.len());
+        ui.vertical(|ui| {
+            let title = if read_only.is_some() {
+                "SAMPLE RATE (ENTITY 41) · READ-ONLY"
+            } else {
+                "SAMPLE RATE (ENTITY 41)"
+            };
+            ui.label(
+                RichText::new(title)
+                    .font(FontId::proportional(10.0))
+                    .color(pal.text_muted),
+            );
+            ui.horizontal(|ui| {
+                let cur_sr = self.controller.state().config.sample_rate;
+                for sr in SampleRate::ALL {
+                    let active = cur_sr == sr;
+                    let response = ui
+                        .add_enabled_ui(read_only.is_none(), |ui| {
+                            studio_toggle_btn(ui, sr.khz_label(), active, pal.accent_orange, pal)
+                        })
+                        .inner;
+                    let response = match &read_only {
+                        Some(reason) => response.on_disabled_hover_text(reason.as_str()),
+                        None => response,
+                    };
+                    if response.clicked() {
+                        self.status_banner = match self.controller.set_sample_rate(sr) {
+                            Ok(()) => format!("SET SAMPLE RATE -> {}", sr.khz_label()),
+                            Err(error) => error.to_string(),
+                        };
+                    }
+                    buttons.push(response);
+                }
+            });
+            if let Some(reason) = &read_only {
+                ui.label(
+                    RichText::new(reason.as_str())
+                        .font(FontId::proportional(10.0))
+                        .color(pal.text_muted),
+                );
+            }
+        });
+        buttons
     }
 
     fn draw_analog_inputs_rack(&mut self, ui: &mut Ui, pal: &StudioPalette) {
@@ -511,34 +599,50 @@ impl ControlCenterApp {
 
                                     // Source Selector Row: INPUT / MIC / LINE / INST (Ch 1-2 only)
                                     ui.horizontal_wrapped(|ui| {
-                                        for mode in
-                                            [InputType::ComboAuto, InputType::Mic, InputType::Line]
-                                        {
-                                            let active = inp.input_type == mode;
-                                            let lbl = match mode {
-                                                InputType::ComboAuto => "AUTO",
-                                                InputType::Mic => "MIC",
-                                                InputType::Line => "LINE",
-                                                InputType::Inst => "INST",
-                                            };
-                                            if studio_toggle_btn(
-                                                ui,
-                                                lbl,
-                                                active,
-                                                pal.sync_teal,
-                                                pal,
-                                            )
-                                            .clicked()
-                                            {
-                                                if let Err(error) =
-                                                    self.controller.set_input_type(ch_idx, mode)
+                                        if self.controller.is_simulated() {
+                                            for mode in [
+                                                InputType::ComboAuto,
+                                                InputType::Mic,
+                                                InputType::Line,
+                                            ] {
+                                                let active = inp.input_type == mode;
+                                                let lbl = match mode {
+                                                    InputType::ComboAuto => "AUTO",
+                                                    InputType::Mic => "MIC",
+                                                    InputType::Line => "LINE",
+                                                    InputType::Inst => "INST",
+                                                };
+                                                if studio_toggle_btn(
+                                                    ui,
+                                                    lbl,
+                                                    active,
+                                                    pal.sync_teal,
+                                                    pal,
+                                                )
+                                                .clicked()
                                                 {
-                                                    self.status_banner = error.to_string();
-                                                    return;
+                                                    if let Err(error) =
+                                                        self.controller.set_input_type(ch_idx, mode)
+                                                    {
+                                                        self.status_banner = error.to_string();
+                                                        return;
+                                                    }
                                                 }
                                             }
+                                        } else {
+                                            ui.label(if inp.jack_active {
+                                                "JACK: LINE"
+                                            } else if inp.mic_active {
+                                                "JACK: MIC"
+                                            } else {
+                                                "AUTO: NO JACK"
+                                            });
                                         }
                                         if inp.supports_inst() {
+                                            if !self.controller.is_simulated() && !inp.jack_active {
+                                                ui.disable();
+                                            }
+
                                             let active =
                                                 inp.inst_hi_z || inp.input_type == InputType::Inst;
                                             if studio_toggle_btn(
@@ -602,10 +706,8 @@ impl ControlCenterApp {
                                                 return;
                                             }
                                         }
-                                        if !matches!(
-                                            inp.input_type,
-                                            InputType::Line | InputType::ComboAuto
-                                        ) {
+                                        if !line_pad_available(self.controller.is_simulated(), &inp)
+                                        {
                                             ui.disable();
                                         }
                                         let line_pad_on = inp.pad_line == LinePad::Pad20dB;
@@ -615,6 +717,9 @@ impl ControlCenterApp {
                                             line_pad_on,
                                             pal.warn_amber,
                                             pal,
+                                        )
+                                        .on_disabled_hover_text(
+                                            "Line pad requires a connected line input",
                                         )
                                         .clicked()
                                         {
@@ -828,26 +933,38 @@ impl ControlCenterApp {
                             });
 
                             // Persistent 16-char Channel Name Editor
-                            let mut name_buf = ch.name.clone();
-                            let name_resp = ui.add(
-                                egui::TextEdit::singleline(&mut name_buf)
-                                    .font(FontId::monospace(10.0))
-                                    .char_limit(16)
-                                    .desired_width(f32::INFINITY),
-                            );
-                            if name_resp.changed() {
-                                if let Err(error) =
-                                    self.controller.set_mixer_channel_name(mixer_idx, &name_buf)
+                            if self.controller.is_simulated() {
+                                let mut name_buf = ch.name.clone();
+                                let name_resp = ui.add(
+                                    egui::TextEdit::singleline(&mut name_buf)
+                                        .font(FontId::monospace(10.0))
+                                        .char_limit(16)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                if name_resp.changed() {
+                                    if let Err(error) =
+                                        self.controller.set_mixer_channel_name(mixer_idx, &name_buf)
+                                    {
+                                        self.status_banner = error.to_string();
+                                        return;
+                                    }
+                                }
+                            } else {
+                                ui.label(format!("{} (read-only)", ch.name));
+                            }
+                            let mut visible = self.visible;
+                            if ui
+                                .checkbox(&mut visible[mixer_idx], "Show in overview")
+                                .changed()
+                            {
+                                match visibility_path().and_then(|p| save_visibility(&p, &visible))
                                 {
-                                    self.status_banner = error.to_string();
-                                    return;
+                                    Ok(()) => self.visible = visible,
+                                    Err(e) => {
+                                        self.status_banner = format!("Overview settings: {e}")
+                                    }
                                 }
                             }
-
-                            ui.checkbox(
-                                &mut self.controller.state_mut().mixer_channels[mixer_idx].show,
-                                "Show in overview",
-                            );
                             // Pan Readout & Slider (-64..+64)
                             ui.horizontal(|ui| {
                                 ui.label(
@@ -919,7 +1036,11 @@ impl ControlCenterApp {
                                     .clicked()
                                 {
                                     let next_grp = (ch.group + 1) % 5;
-                                    self.controller.set_mixer_channel_group(mixer_idx, next_grp);
+                                    if let Err(e) =
+                                        self.controller.set_mixer_channel_group(mixer_idx, next_grp)
+                                    {
+                                        self.status_banner = e.to_string();
+                                    }
                                 }
                             });
 
@@ -978,11 +1099,14 @@ impl ControlCenterApp {
                         .color(pal.accent_orange),
                 );
                 let base = bank.base_index();
+                if !self.visible[base..base + 8].contains(&true) {
+                    ui.label("No visible strips. Select channels in the bank view.");
+                }
                 ui.horizontal_wrapped(|ui| {
                     for offset in 0..8 {
                         let idx = base + offset;
                         let ch = self.controller.state().mixer_channels[idx].clone();
-                        if !ch.show {
+                        if !self.visible[idx] {
                             continue;
                         }
                         Frame::NONE
@@ -1093,7 +1217,7 @@ impl ControlCenterApp {
                     // Master Cue Level (-61.0 .. 0.0 dB, param_id 0x55) + simulator-only Mute / Solo
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new("CUE MASTER LEVEL (0x55)")
+                            RichText::new("CUE MASTER LEVEL")
                                 .font(FontId::monospace(10.0))
                                 .color(pal.text_muted),
                         );
@@ -1264,7 +1388,7 @@ impl ControlCenterApp {
 
                     // Analog Out 1-2 .. 7-8
                     ui.label(
-                        RichText::new("ANALOG LINE OUTPUTS 1-8 (0x7a)")
+                        RichText::new("ANALOG LINE OUTPUTS 1-8")
                             .font(FontId::monospace(10.0))
                             .color(pal.text_muted),
                     );
@@ -1307,7 +1431,7 @@ impl ControlCenterApp {
 
                     // ADAT Out 1-2 .. 7-8
                     ui.label(
-                        RichText::new("ADAT OPTICAL OUTPUTS 1-8 (0x7e)")
+                        RichText::new("ADAT OPTICAL OUTPUTS 1-8")
                             .font(FontId::monospace(10.0))
                             .color(pal.text_muted),
                     );
@@ -1350,7 +1474,7 @@ impl ControlCenterApp {
                     // Loopback Source (Disabled / Cue Mix / USB 17-18)
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new("LOOPBACK REC (0x4A):")
+                            RichText::new("LOOPBACK REC:")
                                 .font(FontId::monospace(10.0))
                                 .color(pal.text_muted),
                         );
@@ -1382,6 +1506,7 @@ impl ControlCenterApp {
         }
         let mut open = self.show_firmware_modal;
         egui::Window::new("FIRMWARE ARCHIVE INSPECTOR & USB DFU (INTERFACE 3)")
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -1456,20 +1581,7 @@ impl eframe::App for ControlCenterApp {
         self.handle_keyboard_shortcuts(ctx);
 
         while let Ok(update) = self.meters.try_recv() {
-            match update {
-                Ok(frame) => {
-                    if let Some(state_266) = frame.state_266 {
-                        if let Err(e) = self.controller.state_mut().apply_afex_state_266(&state_266)
-                        {
-                            self.status_banner = format!("State decode error: {e}");
-                        }
-                    }
-                    self.controller
-                        .state_mut()
-                        .apply_afex_vu_152(&frame.vu_152);
-                }
-                Err(e) => self.status_banner = format!("Meters stale: {e}"),
-            }
+            self.apply_telemetry(update);
         }
         ctx.request_repaint_after(Duration::from_millis(30));
         // Bottom Studio Telemetry Status Bar
@@ -1758,5 +1870,120 @@ fn draw_vertical_vu_bar(ui: &mut Ui, vu: u8, height: f32, pal: &StudioPalette) {
             pal.meter_green
         };
         painter.rect_filled(fill_rect, CornerRadius::ZERO, col);
+    }
+}
+
+fn line_pad_available(simulated: bool, input: &audiofuse_core::AnalogInputChannel) -> bool {
+    matches!(input.input_type, InputType::ComboAuto | InputType::Line)
+        && (simulated || input.jack_active)
+}
+
+fn visibility_path() -> std::io::Result<PathBuf> {
+    let root = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
+        .ok_or_else(|| std::io::Error::other("No configuration directory"))?;
+    Ok(root.join("audiofuse-control-center/overview.json"))
+}
+fn read_visibility(path: &std::path::Path) -> std::io::Result<[bool; 24]> {
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+fn save_visibility(path: &std::path::Path, visible: &[bool; 24]) -> std::io::Result<()> {
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temp, serde_json::to_vec(visible)?)?;
+    std::fs::rename(temp, path)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn recovered_frame_updates_clock_and_clears_stale_feedback() {
+        let ctrl = AudioFuseController::new(std::sync::Arc::new(
+            audiofuse_core::SimulatedTransport::default(),
+        ))
+        .unwrap();
+        let mut app = ControlCenterApp::new(ctrl, StudioThemeMode::DarkCarbon);
+        app.apply_telemetry(Err(audiofuse_core::TransportError::DeviceNotFound));
+        assert!(app.status_banner.starts_with("Meters stale:"));
+        app.apply_telemetry(Ok(TelemetryFrame {
+            state_266: None,
+            vu_152: [0; audiofuse_core::AFEX_VU_SIZE],
+            clock: Some((
+                ClockSource::WordClock,
+                [false, false, true],
+                SampleRate::Rate88200,
+            )),
+        }));
+        assert_eq!(app.status_banner, "Meters current");
+        assert!(app.controller.state().config.clock_locked);
+        assert_eq!(
+            app.controller.state().config.sample_rate,
+            SampleRate::Rate88200
+        );
+    }
+    #[test]
+    fn overview_survives_restart() {
+        let path =
+            std::env::temp_dir().join(format!("af-overview-test-{}.json", std::process::id()));
+        let visible = std::array::from_fn(|i| i % 3 == 0);
+        save_visibility(&path, &visible).unwrap();
+        assert_eq!(read_visibility(&path).unwrap(), visible);
+        std::fs::remove_file(path).unwrap();
+    }
+    fn render_rate_controls(app: &mut ControlCenterApp) -> (Vec<bool>, String) {
+        let ctx = egui::Context::default();
+        let pal = StudioPalette::for_mode(StudioThemeMode::DarkCarbon);
+        let mut enabled = Vec::new();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                enabled = app
+                    .draw_sample_rate_controls(ui, &pal)
+                    .iter()
+                    .map(|r| r.enabled())
+                    .collect();
+            });
+        });
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (enabled, text)
+    }
+    #[test]
+    fn unprivileged_live_rate_is_read_only_indicator() {
+        let sim = std::sync::Arc::new(audiofuse_core::SimulatedTransport::default());
+        sim.set_sample_rate_read_only(Some(audiofuse_core::SAMPLE_RATE_READ_ONLY_REASON.into()));
+        let ctrl = AudioFuseController::new(sim).unwrap();
+        let mut app = ControlCenterApp::new(ctrl, StudioThemeMode::DarkCarbon);
+        let (enabled, text) = render_rate_controls(&mut app);
+        assert_eq!(enabled, vec![false; 4]);
+        assert!(text.contains("READ-ONLY"));
+        assert!(text.contains(audiofuse_core::SAMPLE_RATE_READ_ONLY_REASON));
+        assert!(!text.contains("os error"));
+    }
+    #[test]
+    fn privileged_rate_buttons_stay_enabled() {
+        let ctrl = AudioFuseController::new(std::sync::Arc::new(
+            audiofuse_core::SimulatedTransport::default(),
+        ))
+        .unwrap();
+        let mut app = ControlCenterApp::new(ctrl, StudioThemeMode::DarkCarbon);
+        let (enabled, text) = render_rate_controls(&mut app);
+        assert_eq!(enabled, vec![true; 4]);
+        assert!(!text.contains("READ-ONLY"));
+    }
+    #[test]
+    fn unplugged_auto_has_no_live_line_pad() {
+        let mut input = audiofuse_core::AudioFuseState::default().inputs[0].clone();
+        input.input_type = InputType::ComboAuto;
+        input.jack_active = false;
+        assert!(!line_pad_available(false, &input));
+        assert!(line_pad_available(true, &input));
     }
 }

@@ -9,7 +9,7 @@ BuildRequires:  rust
 BuildRequires:  pkgconfig(libusb-1.0)
 BuildRequires:  pkgconfig(alsa)
 Requires:       libusbx
-Requires:       alsa-lib
+Requires:       alsa-lib alsa-utils dkms
 Requires:       systemd-udev
 Requires:       libX11 libXcursor libXi libxkbcommon-x11 libglvnd-glx libglvnd-egl libwayland-client
 
@@ -19,8 +19,8 @@ BuildRequires: systemd-rpm-macros
 %description
 Native Linux replacement for the Arturia AudioFuse 8Pre Control Center (1c75:af0e).
 Provides 8 analog input channel strips, 24-channel low-latency hardware cue mixer,
-master monitor section, output/loopback routing matrix, 78-byte real-time VU metering,
-hardware presets, .af8pre firmware inspection, CLI, and non-root udev rules.
+master monitor section, output/loopback routing matrix, 152-byte real-time VU metering,
+local JSON presets, .af8pre firmware inspection, CLI, and non-root udev rules.
 
 %prep
 %autosetup
@@ -29,6 +29,7 @@ hardware presets, .af8pre firmware inspection, CLI, and non-root udev rules.
 cargo build --frozen --release --workspace
 
 %install
+make install-helper DESTDIR=%{buildroot}
 install -Dm755 target/release/audiofuse-control-center %{buildroot}%{_bindir}/audiofuse-control-center
 install -Dm755 target/release/audiofuse-cli %{buildroot}%{_bindir}/audiofuse-cli
 install -Dm644 udev/70-arturia-audiofuse.rules %{buildroot}%{_udevrulesdir}/70-arturia-audiofuse.rules
@@ -38,7 +39,15 @@ install -Dm644 packaging/audiofuse-control-center.svg %{buildroot}%{_datadir}/ic
 %post
 if command -v udevadm >/dev/null; then udevadm control --reload-rules || :; fi
 
+/usr/lib/audiofuse-control-center/audiofuse8pre-dkms install
+
+%preun
+if [ "$1" -eq 0 ]; then /usr/lib/audiofuse-control-center/audiofuse8pre-dkms remove; fi
+
 %files
+/usr/lib/modules-load.d/audiofuse8pre-ctl.conf
+/usr/lib/audiofuse-control-center/
+/usr/src/audiofuse8pre-ctl-0.2.1/
 %doc README.md
 %{_bindir}/audiofuse-control-center
 %{_bindir}/audiofuse-cli

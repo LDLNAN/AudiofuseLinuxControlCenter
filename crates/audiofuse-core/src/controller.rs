@@ -15,8 +15,44 @@ use std::sync::Arc;
 /// Telemetry payload emitted by the background polling worker (`subscribe_telemetry`).
 #[derive(Debug, Clone)]
 pub struct TelemetryFrame {
+    pub clock: Option<(ClockSource, [bool; 3], SampleRate)>,
     pub vu_152: [u8; AFEX_VU_SIZE],
     pub state_266: Option<[u8; AFEX_STATE_SIZE]>,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ApplyReport {
+    pub applied: Vec<String>,
+    pub skipped: Vec<String>,
+}
+impl ApplyReport {
+    pub fn skipped_summary(&self) -> String {
+        if self.skipped.is_empty() {
+            "none".into()
+        } else {
+            self.skipped.join(", ")
+        }
+    }
+
+    fn record(
+        &mut self,
+        field: impl Into<String>,
+        result: Result<(), TransportError>,
+    ) -> Result<(), TransportError> {
+        let field = field.into();
+        match result {
+            Ok(()) => {
+                self.applied.push(field);
+                Ok(())
+            }
+            Err(error) => Err(TransportError::Partial {
+                applied: self.applied.clone(),
+                skipped: self.skipped.clone(),
+                failed: field,
+                cause: Box::new(error),
+            }),
+        }
+    }
 }
 
 /// High-level state controller for the Arturia AudioFuse 8Pre (`1c75:af0e`).
@@ -84,14 +120,30 @@ impl AudioFuseController {
         Ok(vu)
     }
 
+    pub fn apply_state_snapshot(
+        &mut self,
+        snapshot: &[u8; AFEX_STATE_SIZE],
+    ) -> Result<(), TransportError> {
+        self.state
+            .apply_afex_state_266(snapshot)
+            .map_err(TransportError::Other)?;
+        if self.is_simulated() {
+            for input in &mut self.state.inputs {
+                if input.input_type == InputType::ComboAuto {
+                    input.mic_active = true;
+                    input.jack_active = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Poll both the 266-byte state snapshot (`Unit 0x0d`) and 152-byte live VU meters (`Unit 0x11`).
     pub fn poll_state_and_meters(
         &mut self,
     ) -> Result<([u8; AFEX_STATE_SIZE], [u8; AFEX_VU_SIZE]), TransportError> {
         let snap = self.transport.read_state_266()?;
-        self.state
-            .apply_afex_state_266(&snap)
-            .map_err(TransportError::Other)?;
+        self.apply_state_snapshot(&snap)?;
         let vu = self.transport.read_vu_152()?;
         self.state.apply_afex_vu_152(&vu);
         Ok((snap, vu))
@@ -107,25 +159,25 @@ impl AudioFuseController {
         std::thread::spawn(move || {
             let mut tick: u64 = 0;
             loop {
-                let state_266 = if tick % 10 == 0 {
-                    match transport.read_state_266() {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            if sender.send(Err(e)).is_err() {
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            tick = tick.wrapping_add(1);
-                            continue;
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                let frame = transport
-                    .read_vu_152()
-                    .map(|vu_152| TelemetryFrame { vu_152, state_266 });
+                let frame = (|| {
+                    let (state_266, clock) = if tick % 10 == 0 {
+                        (
+                            Some(transport.read_state_266()?),
+                            Some((
+                                transport.get_clock_source()?,
+                                transport.get_clock_validity()?,
+                                transport.get_sample_rate()?,
+                            )),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    Ok(TelemetryFrame {
+                        vu_152: transport.read_vu_152()?,
+                        state_266,
+                        clock,
+                    })
+                })();
                 if sender.send(frame).is_err() {
                     break;
                 }
@@ -156,7 +208,10 @@ impl AudioFuseController {
 
         if self.transport.is_simulated() {
             for i in 0..24 {
-                if let Ok(ch_name) = self.transport.get_string(STRING_TYPE_CHANNEL_NAME, i as u16) {
+                if let Ok(ch_name) = self
+                    .transport
+                    .get_string(STRING_TYPE_CHANNEL_NAME, i as u16)
+                {
                     if !ch_name.is_empty() {
                         self.state.mixer_channels[i].name = ch_name;
                     }
@@ -176,29 +231,51 @@ impl AudioFuseController {
         Ok(())
     }
 
+    fn confirm_field(
+        &mut self,
+        label: &str,
+        matches: impl FnOnce(&AudioFuseState) -> bool,
+    ) -> Result<(), TransportError> {
+        self.verify_hardware_state_readback()?;
+        if matches(&self.state) {
+            Ok(())
+        } else {
+            Err(TransportError::HardwareRejected(format!(
+                "{label} differs on readback"
+            )))
+        }
+    }
+
     // --- Global & Clock Controls ---
 
     pub fn set_device_name(&mut self, name: &str) -> Result<(), TransportError> {
         self.transport
             .set_string(STRING_TYPE_DEVICE_NAME, 0, name)?;
         let encoded = encode_device_name_16(name);
-        self.state.config.device_name = decode_device_string_16(&encoded);
-        Ok(())
+        let expected = decode_device_string_16(&encoded);
+        if self.is_simulated() {
+            self.state.config.device_name.clone_from(&expected);
+        }
+        self.confirm_field("device name", |s| s.config.device_name == expected)
     }
 
     pub fn set_device_mode(&mut self, mode: DeviceMode) -> Result<(), TransportError> {
-        self.transport.set_parameter(
-            param_id::DEVICE_MODE,
-            AFEX_GLOBAL_CHANNEL,
-            mode as u16,
-        )?;
-        self.state.config.device_mode = mode;
-        Ok(())
+        self.transport
+            .set_parameter(param_id::DEVICE_MODE, AFEX_GLOBAL_CHANNEL, mode as u16)?;
+        if self.is_simulated() {
+            self.state.config.device_mode = mode;
+        }
+        self.confirm_field("device_mode", |s| s.config.device_mode == mode)
     }
 
     pub fn set_clock_source(&mut self, source: ClockSource) -> Result<(), TransportError> {
         self.transport.set_clock_source(source)?;
-        self.state.config.clock_source = source;
+        self.state.config.clock_source = self.transport.get_clock_source()?;
+        if self.state.config.clock_source != source {
+            return Err(TransportError::HardwareRejected(
+                "Clock source differs on readback".into(),
+            ));
+        }
         if let Ok(v) = self.transport.get_clock_validity() {
             self.state.config.clock_validity = v;
         }
@@ -210,7 +287,15 @@ impl AudioFuseController {
         Ok(())
     }
 
+    /// `Some(reason)` when the sample rate is read-only for this user (live bridge without privilege).
+    pub fn sample_rate_read_only_reason(&self) -> Option<String> {
+        self.transport.sample_rate_read_only_reason()
+    }
+
     pub fn set_sample_rate(&mut self, rate: SampleRate) -> Result<(), TransportError> {
+        if let Some(reason) = self.sample_rate_read_only_reason() {
+            return Err(TransportError::ReadOnly(reason));
+        }
         self.transport.set_sample_rate(rate)?;
         self.state.config.sample_rate = rate;
         Ok(())
@@ -225,8 +310,12 @@ impl AudioFuseController {
             AFEX_GLOBAL_CHANNEL,
             imp as u16,
         )?;
-        self.state.config.wordclock_impedance = imp;
-        Ok(())
+        if self.is_simulated() {
+            self.state.config.wordclock_impedance = imp;
+        }
+        self.confirm_field("wordclock_impedance", |s| {
+            s.config.wordclock_impedance == imp
+        })
     }
 
     pub fn set_wordclock_thru(&mut self, enabled: bool) -> Result<(), TransportError> {
@@ -235,26 +324,29 @@ impl AudioFuseController {
             AFEX_GLOBAL_CHANNEL,
             u16::from(enabled),
         )?;
-        self.state.config.wordclock_thru = enabled;
-        Ok(())
+        if self.is_simulated() {
+            self.state.config.wordclock_thru = enabled;
+        }
+        self.confirm_field("wordclock_thru", |s| s.config.wordclock_thru == enabled)
     }
 
     pub fn set_adat_on(&mut self, enabled: bool) -> Result<(), TransportError> {
-        self.transport.set_parameter(
-            param_id::ADAT_ON,
-            AFEX_GLOBAL_CHANNEL,
-            u16::from(enabled),
-        )?;
-        self.state.config.adat_on = enabled;
-        Ok(())
+        self.transport
+            .set_parameter(param_id::ADAT_ON, AFEX_GLOBAL_CHANNEL, u16::from(enabled))?;
+        if self.is_simulated() {
+            self.state.config.adat_on = enabled;
+        }
+        self.confirm_field("adat_on", |s| s.config.adat_on == enabled)
     }
 
     pub fn set_smux_mode(&mut self, mode: SmuxMode) -> Result<(), TransportError> {
         // Verified: SMUX Mode (0x83) uses channel = 0x00 on hardware.
         self.transport
             .set_parameter(param_id::SMUX_MODE, 0x00, mode as u16)?;
-        self.state.config.smux_mode = mode;
-        Ok(())
+        if self.is_simulated() {
+            self.state.config.smux_mode = mode;
+        }
+        self.confirm_field("smux_mode", |s| s.config.smux_mode == mode)
     }
 
     // --- 8 Analog Input Channel Strip Controls ---
@@ -268,7 +360,9 @@ impl AudioFuseController {
         input_type: InputType,
     ) -> Result<(), TransportError> {
         if channel_idx >= 8 {
-            return Ok(());
+            return Err(TransportError::InvalidArgument(format!(
+                "channel_idx {channel_idx} is outside 0..8"
+            )));
         }
         if !self.transport.is_simulated() {
             if channel_idx < 2 && input_type == InputType::Inst {
@@ -285,32 +379,32 @@ impl AudioFuseController {
                 .set_simulated_input_type(channel_idx, input_type);
         }
 
-        let validated = if channel_idx >= 2 && input_type == InputType::Inst {
-            InputType::Line
-        } else {
-            input_type
-        };
-        if !matches!(validated, InputType::ComboAuto | InputType::Mic)
+        if channel_idx >= 2 && input_type == InputType::Inst {
+            return Err(TransportError::InvalidArgument(
+                "Instrument mode requires input 1 or 2".into(),
+            ));
+        }
+        if !matches!(input_type, InputType::ComboAuto | InputType::Mic)
             && self.state.inputs[channel_idx].pad_mic != MicPadBoost::Off
         {
             self.set_input_mic_pad_boost(channel_idx, MicPadBoost::Off)?;
         }
-        if !matches!(validated, InputType::ComboAuto | InputType::Line)
+        if !matches!(input_type, InputType::ComboAuto | InputType::Line)
             && self.state.inputs[channel_idx].pad_line != LinePad::Off
         {
             self.set_input_line_pad(channel_idx, LinePad::Off)?;
         }
         self.transport
-            .set_simulated_input_type(channel_idx, validated)?;
+            .set_simulated_input_type(channel_idx, input_type)?;
         let inp = &mut self.state.inputs[channel_idx];
-        inp.input_type = validated;
-        inp.mic_active = matches!(validated, InputType::ComboAuto | InputType::Mic);
+        inp.input_type = input_type;
+        inp.mic_active = matches!(input_type, InputType::ComboAuto | InputType::Mic);
         inp.jack_active = matches!(
-            validated,
+            input_type,
             InputType::ComboAuto | InputType::Line | InputType::Inst
         );
         if channel_idx < 2 {
-            let inst_flag = validated == InputType::Inst;
+            let inst_flag = input_type == InputType::Inst;
             self.transport.set_parameter(
                 param_id::INPUT_INST,
                 channel_idx as u8,
@@ -339,11 +433,8 @@ impl AudioFuseController {
             return self.set_input_type(channel_idx, new_type);
         }
 
-        self.transport.set_parameter(
-            param_id::INPUT_INST,
-            channel_idx as u8,
-            u16::from(hi_z),
-        )?;
+        self.transport
+            .set_parameter(param_id::INPUT_INST, channel_idx as u8, u16::from(hi_z))?;
         self.verify_hardware_state_readback()?;
         if self.state.inputs[channel_idx].inst_hi_z != hi_z {
             return Err(TransportError::HardwareRejected(format!(
@@ -362,22 +453,39 @@ impl AudioFuseController {
         enabled: bool,
     ) -> Result<(), TransportError> {
         if channel_idx >= 8 {
-            return Ok(());
+            return Err(TransportError::InvalidArgument(format!(
+                "channel_idx {channel_idx} is outside 0..8"
+            )));
         }
         self.transport.set_parameter(
             param_id::INPUT_PHANTOM,
             channel_idx as u8,
             u16::from(enabled),
         )?;
-        self.state.inputs[channel_idx].phantom_48v = enabled;
-        Ok(())
+        if self.is_simulated() {
+            self.state.inputs[channel_idx].phantom_48v = enabled;
+        }
+        self.confirm_field("phantom_48v", |s| {
+            s.inputs[channel_idx].phantom_48v == enabled
+        })
     }
 
     /// Toggle +48V Phantom Power for a bank of 4 channels (`bank = 0` for `1-4`, `bank = 1` for `5-8`).
     pub fn set_phantom_bank_4(&mut self, bank: usize, enabled: bool) -> Result<(), TransportError> {
-        let start = if bank == 0 { 0 } else { 4 };
+        if bank > 1 {
+            return Err(TransportError::InvalidArgument(
+                "Phantom bank must be 0 or 1".into(),
+            ));
+        }
+        let start = bank * 4;
         for ch in start..start + 4 {
-            self.set_input_phantom(ch, enabled)?;
+            self.set_input_phantom(ch, enabled).map_err(|e| {
+                TransportError::Other(format!(
+                    "Phantom bank: {} of 4 confirmed; input {} failed: {e}",
+                    ch - start,
+                    ch + 1
+                ))
+            })?;
         }
         Ok(())
     }
@@ -389,15 +497,21 @@ impl AudioFuseController {
         inverted: bool,
     ) -> Result<(), TransportError> {
         if channel_idx >= 8 {
-            return Ok(());
+            return Err(TransportError::InvalidArgument(format!(
+                "channel_idx {channel_idx} is outside 0..8"
+            )));
         }
         self.transport.set_parameter(
             param_id::INPUT_PHASE_INVERT,
             channel_idx as u8,
             u16::from(inverted),
         )?;
-        self.state.inputs[channel_idx].phase_invert = inverted;
-        Ok(())
+        if self.is_simulated() {
+            self.state.inputs[channel_idx].phase_invert = inverted;
+        }
+        self.confirm_field("phase_invert", |s| {
+            s.inputs[channel_idx].phase_invert == inverted
+        })
     }
 
     /// Set `-20dB` Line Pad for an analog input (`0..7`, `param_id = 0x0c`).
@@ -409,7 +523,9 @@ impl AudioFuseController {
         pad: LinePad,
     ) -> Result<(), TransportError> {
         if channel_idx >= 8 {
-            return Ok(());
+            return Err(TransportError::InvalidArgument(format!(
+                "channel_idx {channel_idx} is outside 0..8"
+            )));
         }
         if self.transport.is_simulated()
             && pad != LinePad::Off
@@ -448,14 +564,16 @@ impl AudioFuseController {
         mode: MicPadBoost,
     ) -> Result<(), TransportError> {
         if channel_idx >= 8 {
-            return Ok(());
+            return Err(TransportError::InvalidArgument(format!(
+                "channel_idx {channel_idx} is outside 0..8"
+            )));
         }
         if self.transport.is_simulated()
             && mode != MicPadBoost::Off
             && !self.state.inputs[channel_idx].mic_active
         {
             return Err(TransportError::Other(
-                "Mic pad/boost requires Mic or Auto".into(),
+                "Simulator mic pad/boost requires a mic-capable input (Mic or Auto)".into(),
             ));
         }
         self.transport
@@ -526,7 +644,31 @@ impl AudioFuseController {
         self.transport
             .set_parameter(param_id::MIXER_CH_GAIN_L, idx as u8, gl as u16)?;
         self.transport
-            .set_parameter(param_id::MIXER_CH_GAIN_R, idx as u8, gr as u16)?;
+            .set_parameter(param_id::MIXER_CH_GAIN_R, idx as u8, gr as u16)
+            .map_err(|e| {
+                TransportError::Other(format!(
+                    "Channel {} left gain submitted; right gain failed: {e}",
+                    idx + 1
+                ))
+            })?;
+        if !self.is_simulated() {
+            let snapshot = self.transport.read_state_266()?;
+            self.state
+                .apply_afex_state_266(&snapshot)
+                .map_err(TransportError::Other)?;
+            for (base, expected) in [
+                (param_id::MIXER_CH_GAIN_L, gl),
+                (param_id::MIXER_CH_GAIN_R, gr),
+            ] {
+                let offset = (base as usize + idx) * 2;
+                if snapshot[offset..offset + 2] != expected.to_le_bytes() {
+                    return Err(TransportError::HardwareRejected(format!(
+                        "Channel {} gain pair differs on readback",
+                        idx + 1
+                    )));
+                }
+            }
+        }
         let (decoded_db, decoded_pan) = decode_mixer_channel_gains_q88(gl, gr);
         self.state.mixer_channels[idx].level_db = decoded_db;
         // Preserve chosen pan when fader is pulled all the way to -inf
@@ -552,8 +694,10 @@ impl AudioFuseController {
                 u16::from(mute),
             )?;
         }
-        self.state.mixer_channels[idx].mute = mute;
-        Ok(())
+        if self.is_simulated() {
+            self.state.mixer_channels[idx].mute = mute;
+        }
+        self.confirm_field("channel mute", |s| s.mixer_channels[idx].mute == mute)
     }
 
     fn write_channel_solo(&mut self, idx: usize, solo: bool) -> Result<(), TransportError> {
@@ -570,8 +714,10 @@ impl AudioFuseController {
                 u16::from(solo),
             )?;
         }
-        self.state.mixer_channels[idx].solo = solo;
-        Ok(())
+        if self.is_simulated() {
+            self.state.mixer_channels[idx].solo = solo;
+        }
+        self.confirm_field("channel solo", |s| s.mixer_channels[idx].solo == solo)
     }
 
     /// Set fader level in dB (`-61.0..=+12.0` dB) for a mixer channel (`0..23`), propagating
@@ -582,21 +728,32 @@ impl AudioFuseController {
         level_db: f32,
     ) -> Result<(), TransportError> {
         if mixer_idx >= 24 {
-            return Ok(());
+            return Err(TransportError::InvalidArgument(format!(
+                "mixer_idx {mixer_idx} is outside 0..24"
+            )));
         }
-        let clamped_db = level_db.clamp(MIXER_FADER_MIN_DB, MIXER_FADER_MAX_DB);
-        let delta = clamped_db - self.state.mixer_channels[mixer_idx].level_db;
+        if !(MIXER_FADER_MIN_DB..=MIXER_FADER_MAX_DB).contains(&level_db) {
+            return Err(TransportError::InvalidArgument(
+                "Mixer level must be -61..=12 dB".into(),
+            ));
+        }
+        let delta = level_db - self.state.mixer_channels[mixer_idx].level_db;
         let partner = self.stereo_partner(mixer_idx);
 
         let targets = self.linked_and_grouped_channels(mixer_idx);
-        for idx in targets {
+        for (completed, &idx) in targets.iter().enumerate() {
             let level = if idx == mixer_idx || Some(idx) == partner {
-                clamped_db
+                level_db
             } else {
                 self.state.mixer_channels[idx].level_db + delta
             };
             let pan = self.state.mixer_channels[idx].pan;
-            self.write_channel_gain_pan(idx, level, pan)?;
+            self.write_channel_gain_pan(idx, level, pan).map_err(|e| {
+                TransportError::Other(format!(
+                    "Mixer channels confirmed {:?}; failed on index {idx}: {e}",
+                    &targets[..completed]
+                ))
+            })?;
         }
         Ok(())
     }
@@ -608,7 +765,14 @@ impl AudioFuseController {
         pan: i8,
     ) -> Result<(), TransportError> {
         if mixer_idx >= 24 {
-            return Ok(());
+            return Err(TransportError::InvalidArgument(format!(
+                "mixer_idx {mixer_idx} is outside 0..24"
+            )));
+        }
+        if !(-64..=64).contains(&pan) {
+            return Err(TransportError::InvalidArgument(
+                "Pan must be -64..=64".into(),
+            ));
         }
         let level_db = self.state.mixer_channels[mixer_idx].level_db;
         self.write_channel_gain_pan(mixer_idx, level_db, pan)
@@ -621,11 +785,18 @@ impl AudioFuseController {
         mute: bool,
     ) -> Result<(), TransportError> {
         if mixer_idx >= 24 {
-            return Ok(());
+            return Err(TransportError::InvalidArgument(format!(
+                "mixer_idx {mixer_idx} is outside 0..24"
+            )));
         }
         let targets = self.linked_and_grouped_channels(mixer_idx);
-        for idx in targets {
-            self.write_channel_mute(idx, mute)?;
+        for (completed, &idx) in targets.iter().enumerate() {
+            self.write_channel_mute(idx, mute).map_err(|e| {
+                TransportError::Other(format!(
+                    "Mixer channels confirmed {:?}; failed on index {idx}: {e}",
+                    &targets[..completed]
+                ))
+            })?;
         }
         Ok(())
     }
@@ -637,11 +808,18 @@ impl AudioFuseController {
         solo: bool,
     ) -> Result<(), TransportError> {
         if mixer_idx >= 24 {
-            return Ok(());
+            return Err(TransportError::InvalidArgument(format!(
+                "mixer_idx {mixer_idx} is outside 0..24"
+            )));
         }
         let targets = self.linked_and_grouped_channels(mixer_idx);
-        for idx in targets {
-            self.write_channel_solo(idx, solo)?;
+        for (completed, &idx) in targets.iter().enumerate() {
+            self.write_channel_solo(idx, solo).map_err(|e| {
+                TransportError::Other(format!(
+                    "Mixer channels confirmed {:?}; failed on index {idx}: {e}",
+                    &targets[..completed]
+                ))
+            })?;
         }
         Ok(())
     }
@@ -653,7 +831,9 @@ impl AudioFuseController {
         name: &str,
     ) -> Result<(), TransportError> {
         if mixer_idx >= 24 {
-            return Ok(());
+            return Err(TransportError::InvalidArgument(format!(
+                "mixer_idx {mixer_idx} is outside 0..24"
+            )));
         }
         self.transport
             .set_string(STRING_TYPE_CHANNEL_NAME, mixer_idx as u16, name)?;
@@ -663,15 +843,22 @@ impl AudioFuseController {
     }
 
     /// Assign a mixer channel (`0..23`) to a host-side channel group (`0` = None, `1..=4` = Group 1..4).
-    pub fn set_mixer_channel_group(&mut self, mixer_idx: usize, group: u8) {
-        if mixer_idx >= 24 {
-            return;
+    pub fn set_mixer_channel_group(
+        &mut self,
+        mixer_idx: usize,
+        group: u8,
+    ) -> Result<(), TransportError> {
+        if mixer_idx >= 24 || group > 4 {
+            return Err(TransportError::InvalidArgument(
+                "Mixer index must be 0..24 and group 0..=4".into(),
+            ));
         }
-        let grp = group.min(4);
+        let grp = group;
         self.state.mixer_channels[mixer_idx].group = grp;
         if let Some(partner) = self.stereo_partner(mixer_idx) {
             self.state.mixer_channels[partner].group = grp;
         }
+        Ok(())
     }
 
     /// Toggle stereo linking for a pair (`0` = `1-2`, `1` = `3-4`, `2` = `5-6`, `3` = `7-8`) in a bank.
@@ -682,35 +869,74 @@ impl AudioFuseController {
         linked: bool,
     ) -> Result<(), TransportError> {
         if pair_idx >= 4 {
-            return Ok(());
+            return Err(TransportError::InvalidArgument(format!(
+                "pair_idx {pair_idx} is outside 0..4"
+            )));
         }
         let bank_idx = bank as usize;
         let bit_idx = (bank_idx * 4 + pair_idx) as u8;
         let left_idx = bank.base_index() + pair_idx * 2;
         let right_idx = left_idx + 1;
 
-        self.transport.set_parameter(
-            param_id::MIXER_STEREO_SHOW,
-            bit_idx,
-            u16::from(linked),
-        )?;
+        self.transport
+            .set_parameter(param_id::MIXER_STEREO_SHOW, bit_idx, u16::from(linked))?;
 
+        if self.is_simulated() {
+            self.state.stereo_links[bank_idx].set_pair(pair_idx, linked);
+        }
+        self.confirm_field("Stereo link", |s| {
+            s.stereo_links[bank_idx].get_pair(pair_idx) == linked
+        })?;
         if linked {
             let left_lvl = self.state.mixer_channels[left_idx].level_db;
             let left_mute = self.state.mixer_channels[left_idx].mute;
             let left_solo = self.state.mixer_channels[left_idx].solo;
-            self.write_channel_gain_pan(left_idx, left_lvl, -64)?;
-            self.write_channel_gain_pan(right_idx, left_lvl, 64)?;
-            self.write_channel_mute(right_idx, left_mute)?;
-            self.write_channel_solo(right_idx, left_solo)?;
+            self.write_channel_gain_pan(left_idx, left_lvl, -64)
+                .map_err(|e| {
+                    TransportError::Other(format!(
+                        "Stereo link submitted; channel {} gain_pan failed: {e}",
+                        left_idx + 1
+                    ))
+                })?;
+            self.write_channel_gain_pan(right_idx, left_lvl, 64)
+                .map_err(|e| {
+                    TransportError::Other(format!(
+                        "Stereo link submitted; channel {} gain_pan failed: {e}",
+                        right_idx + 1
+                    ))
+                })?;
+            self.write_channel_mute(right_idx, left_mute).map_err(|e| {
+                TransportError::Other(format!(
+                    "Stereo link submitted; channel {} mute failed: {e}",
+                    right_idx + 1
+                ))
+            })?;
+            self.write_channel_solo(right_idx, left_solo).map_err(|e| {
+                TransportError::Other(format!(
+                    "Stereo link submitted; channel {} solo failed: {e}",
+                    right_idx + 1
+                ))
+            })?;
             self.state.mixer_channels[right_idx].group = self.state.mixer_channels[left_idx].group;
         } else {
             let left_lvl = self.state.mixer_channels[left_idx].level_db;
             let right_lvl = self.state.mixer_channels[right_idx].level_db;
-            self.write_channel_gain_pan(left_idx, left_lvl, 0)?;
-            self.write_channel_gain_pan(right_idx, right_lvl, 0)?;
+            self.write_channel_gain_pan(left_idx, left_lvl, 0)
+                .map_err(|e| {
+                    TransportError::Other(format!(
+                        "Stereo link submitted; channel {} gain_pan failed: {e}",
+                        left_idx + 1
+                    ))
+                })?;
+            self.write_channel_gain_pan(right_idx, right_lvl, 0)
+                .map_err(|e| {
+                    TransportError::Other(format!(
+                        "Stereo link submitted; channel {} gain_pan failed: {e}",
+                        right_idx + 1
+                    ))
+                })?;
         }
-        self.state.stereo_links[bank_idx].set_pair(pair_idx, linked);
+
         Ok(())
     }
 
@@ -737,15 +963,23 @@ impl AudioFuseController {
     }
 
     pub fn set_mixer_output_level_db(&mut self, level_db: f32) -> Result<(), TransportError> {
-        let clamped = level_db.clamp(MIXER_FADER_MIN_DB, 0.0);
-        let raw_q88 = encode_master_level_q88(clamped);
+        if !(MIXER_FADER_MIN_DB..=0.0).contains(&level_db) {
+            return Err(TransportError::InvalidArgument(
+                "Master level must be -61..=0 dB".into(),
+            ));
+        }
+        let raw_q88 = encode_master_level_q88(level_db);
         self.transport.set_parameter(
             param_id::MIXER_OUT_LEVEL,
             AFEX_GLOBAL_CHANNEL,
             raw_q88 as u16,
         )?;
-        self.state.monitor.mixer_output_level_db = decode_master_level_q88(raw_q88);
-        Ok(())
+        if self.is_simulated() {
+            self.state.monitor.mixer_output_level_db = decode_master_level_q88(raw_q88);
+        }
+        self.confirm_field("mixer_output_level_db", |s| {
+            s.monitor.mixer_output_level_db == decode_master_level_q88(raw_q88)
+        })
     }
 
     pub fn set_mixer_output_mute(&mut self, mute: bool) -> Result<(), TransportError> {
@@ -766,8 +1000,10 @@ impl AudioFuseController {
             AFEX_GLOBAL_CHANNEL,
             source as u16,
         )?;
-        self.state.monitor.speakers_source = source;
-        Ok(())
+        if self.is_simulated() {
+            self.state.monitor.speakers_source = source;
+        }
+        self.confirm_field("speakers_source", |s| s.monitor.speakers_source == source)
     }
 
     pub fn set_speakers_mono(&mut self, mono: bool) -> Result<(), TransportError> {
@@ -776,8 +1012,10 @@ impl AudioFuseController {
             AFEX_GLOBAL_CHANNEL,
             u16::from(mono),
         )?;
-        self.state.monitor.speakers_mono = mono;
-        Ok(())
+        if self.is_simulated() {
+            self.state.monitor.speakers_mono = mono;
+        }
+        self.confirm_field("speakers_mono", |s| s.monitor.speakers_mono == mono)
     }
 
     pub fn set_phones_source(&mut self, source: PhonesSource) -> Result<(), TransportError> {
@@ -786,8 +1024,10 @@ impl AudioFuseController {
             AFEX_GLOBAL_CHANNEL,
             source as u16,
         )?;
-        self.state.monitor.phones_source = source;
-        Ok(())
+        if self.is_simulated() {
+            self.state.monitor.phones_source = source;
+        }
+        self.confirm_field("phones_source", |s| s.monitor.phones_source == source)
     }
 
     pub fn set_phones_mono(&mut self, mono: bool) -> Result<(), TransportError> {
@@ -796,8 +1036,10 @@ impl AudioFuseController {
             AFEX_GLOBAL_CHANNEL,
             u16::from(mono),
         )?;
-        self.state.monitor.phones_mono = mono;
-        Ok(())
+        if self.is_simulated() {
+            self.state.monitor.phones_mono = mono;
+        }
+        self.confirm_field("phones_mono", |s| s.monitor.phones_mono == mono)
     }
 
     // --- Output & Loopback Routing Matrix ---
@@ -808,15 +1050,21 @@ impl AudioFuseController {
         source: AnalogOutSource,
     ) -> Result<(), TransportError> {
         if pair_idx >= 4 {
-            return Ok(());
+            return Err(TransportError::InvalidArgument(format!(
+                "pair_idx {pair_idx} is outside 0..4"
+            )));
         }
         self.transport.set_parameter(
             param_id::ANALOG_OUT_SOURCE,
             pair_idx as u8,
             source.to_wire_mask(),
         )?;
-        self.state.routing.analog_out_sources[pair_idx] = source;
-        Ok(())
+        if self.is_simulated() {
+            self.state.routing.analog_out_sources[pair_idx] = source;
+        }
+        self.confirm_field("analog_out_sources", |s| {
+            s.routing.analog_out_sources[pair_idx] == source
+        })
     }
 
     pub fn set_adat_out_source(
@@ -825,15 +1073,21 @@ impl AudioFuseController {
         source: AdatOutSource,
     ) -> Result<(), TransportError> {
         if pair_idx >= 4 {
-            return Ok(());
+            return Err(TransportError::InvalidArgument(format!(
+                "pair_idx {pair_idx} is outside 0..4"
+            )));
         }
         self.transport.set_parameter(
             param_id::ADAT_OUT_SOURCE,
             pair_idx as u8,
             source.to_wire_mask(),
         )?;
-        self.state.routing.adat_out_sources[pair_idx] = source;
-        Ok(())
+        if self.is_simulated() {
+            self.state.routing.adat_out_sources[pair_idx] = source;
+        }
+        self.confirm_field("adat_out_sources", |s| {
+            s.routing.adat_out_sources[pair_idx] == source
+        })
     }
 
     pub fn set_loopback_source(&mut self, source: LoopbackSource) -> Result<(), TransportError> {
@@ -842,8 +1096,10 @@ impl AudioFuseController {
             AFEX_GLOBAL_CHANNEL,
             source.to_wire_mask(),
         )?;
-        self.state.routing.loopback_source = source;
-        Ok(())
+        if self.is_simulated() {
+            self.state.routing.loopback_source = source;
+        }
+        self.confirm_field("loopback_source", |s| s.routing.loopback_source == source)
     }
 
     // --- Presets & Persistence ---
@@ -887,65 +1143,160 @@ impl AudioFuseController {
     pub fn import_preset_file(
         &mut self,
         path: impl AsRef<Path>,
-    ) -> Result<AudioFusePresetFile, PresetError> {
+    ) -> Result<(AudioFusePresetFile, ApplyReport), PresetError> {
         let preset = AudioFusePresetFile::load_from_path(path)?;
-        self.apply_full_state(preset.state.clone())?;
-        Ok(preset)
+        let report = self.apply_full_state(preset.state.clone())?;
+        Ok((preset, report))
     }
 
     /// Push an entire `AudioFuseState` to the hardware/simulator transport.
-    pub fn apply_full_state(&mut self, new_state: AudioFuseState) -> Result<(), TransportError> {
+    pub fn apply_full_state(
+        &mut self,
+        new_state: AudioFuseState,
+    ) -> Result<ApplyReport, TransportError> {
         AudioFusePresetFile::validate_state(&new_state)?;
-        self.set_device_name(&new_state.config.device_name)?;
-        self.set_device_mode(new_state.config.device_mode)?;
+        let mut report = ApplyReport::default();
+        if !self.is_simulated() {
+            self.refresh_all()?;
+            if new_state.config.sample_rate != self.state.config.sample_rate {
+                if let Some(reason) = self.sample_rate_read_only_reason() {
+                    return Err(TransportError::ReadOnly(format!(
+                        "Preset preflight: {reason}; nothing applied"
+                    )));
+                }
+                self.transport.check_rate_change()?;
+            }
+            for (i, (desired, current)) in
+                new_state.inputs.iter().zip(&self.state.inputs).enumerate()
+            {
+                if ((desired.inst_hi_z != current.inst_hi_z
+                    || desired.pad_line != current.pad_line)
+                    && !current.jack_active)
+                    || (desired.pad_mic != current.pad_mic && !current.mic_active)
+                    || (i >= 2 && desired.inst_hi_z)
+                {
+                    return Err(TransportError::HardwareRejected(format!(
+                        "Preset preflight: incompatible connector on input {}; nothing applied",
+                        i + 1
+                    )));
+                }
+            }
+            report.skipped.extend(
+                [
+                    "physical input modes",
+                    "hardware channel names",
+                    "master balance/mute/solo",
+                    "hardware preset slot",
+                ]
+                .map(String::from),
+            );
+        }
+        report.record(
+            "device_name",
+            self.set_device_name(&new_state.config.device_name),
+        )?;
+        report.record(
+            "device_mode",
+            self.set_device_mode(new_state.config.device_mode),
+        )?;
         if self.transport.is_simulated()
             || new_state.config.clock_source != self.state.config.clock_source
         {
-            self.set_clock_source(new_state.config.clock_source)?;
+            report.record(
+                "clock_source",
+                self.set_clock_source(new_state.config.clock_source),
+            )?;
         }
         if self.transport.is_simulated()
             || new_state.config.sample_rate != self.state.config.sample_rate
         {
-            self.set_sample_rate(new_state.config.sample_rate)?;
+            report.record(
+                "sample_rate",
+                self.set_sample_rate(new_state.config.sample_rate),
+            )?;
         }
-        self.set_wordclock_impedance(new_state.config.wordclock_impedance)?;
-        self.set_wordclock_thru(new_state.config.wordclock_thru)?;
-        self.set_adat_on(new_state.config.adat_on)?;
-        self.set_smux_mode(new_state.config.smux_mode)?;
+        report.record(
+            "wordclock_impedance",
+            self.set_wordclock_impedance(new_state.config.wordclock_impedance),
+        )?;
+        report.record(
+            "wordclock_thru",
+            self.set_wordclock_thru(new_state.config.wordclock_thru),
+        )?;
+        report.record("adat_on", self.set_adat_on(new_state.config.adat_on))?;
+        report.record("smux_mode", self.set_smux_mode(new_state.config.smux_mode))?;
 
         for i in 0..8 {
             let inp = &new_state.inputs[i];
             if self.transport.is_simulated() {
-                self.set_input_type(i, inp.input_type)?;
+                report.record(
+                    format!("input_type[{i}]"),
+                    self.set_input_type(i, inp.input_type),
+                )?;
                 if i < 2 {
-                    self.set_input_inst(i, inp.inst_hi_z)?;
+                    report.record(
+                        format!("input_inst[{i}]"),
+                        self.set_input_inst(i, inp.inst_hi_z),
+                    )?;
                 }
-                self.set_input_line_pad(i, inp.pad_line)?;
-                self.set_input_mic_pad_boost(i, inp.pad_mic)?;
+                report.record(
+                    format!("input_line_pad[{i}]"),
+                    self.set_input_line_pad(i, inp.pad_line),
+                )?;
+                report.record(
+                    format!("input_mic_pad_boost[{i}]"),
+                    self.set_input_mic_pad_boost(i, inp.pad_mic),
+                )?;
             } else {
-                // On real hardware, send raw supported parameters without aborting on unplugged jack gates
+                // Capability gates were checked against the initial hardware snapshot.
                 if i < 2 && inp.inst_hi_z != self.state.inputs[i].inst_hi_z {
-                    let _ = self.set_input_inst(i, inp.inst_hi_z);
+                    report.record(
+                        format!("input_inst[{i}]"),
+                        self.set_input_inst(i, inp.inst_hi_z),
+                    )?;
                 }
                 if inp.pad_line != self.state.inputs[i].pad_line {
-                    let _ = self.set_input_line_pad(i, inp.pad_line);
+                    report.record(
+                        format!("input_line_pad[{i}]"),
+                        self.set_input_line_pad(i, inp.pad_line),
+                    )?;
                 }
                 if inp.pad_mic != self.state.inputs[i].pad_mic {
-                    let _ = self.set_input_mic_pad_boost(i, inp.pad_mic);
+                    report.record(
+                        format!("input_mic_pad_boost[{i}]"),
+                        self.set_input_mic_pad_boost(i, inp.pad_mic),
+                    )?;
                 }
             }
-            self.set_input_phantom(i, inp.phantom_48v)?;
-            self.set_input_phase_invert(i, inp.phase_invert)?;
+            report.record(
+                format!("input_phantom[{i}]"),
+                self.set_input_phantom(i, inp.phantom_48v),
+            )?;
+            report.record(
+                format!("input_phase_invert[{i}]"),
+                self.set_input_phase_invert(i, inp.phase_invert),
+            )?;
         }
 
         for bank in 0..3 {
             for pair in 0..4 {
                 let linked = new_state.stereo_links[bank].get_pair(pair);
-                self.transport.set_parameter(
-                    param_id::MIXER_STEREO_SHOW,
-                    (bank * 4 + pair) as u8,
-                    u16::from(linked),
+                report.record(
+                    format!("stereo link[{bank},{pair}]"),
+                    self.transport.set_parameter(
+                        param_id::MIXER_STEREO_SHOW,
+                        (bank * 4 + pair) as u8,
+                        u16::from(linked),
+                    ),
                 )?;
+                if !self.is_simulated() {
+                    report.record(
+                        format!("stereo link[{bank},{pair}] readback"),
+                        self.confirm_field("Stereo link", |s| {
+                            s.stereo_links[bank].get_pair(pair) == linked
+                        }),
+                    )?;
+                }
             }
         }
         self.state.stereo_links = new_state.stereo_links;
@@ -955,34 +1306,79 @@ impl AudioFuseController {
             self.state.mixer_channels[i].group = ch.group;
             self.state.mixer_channels[i].show = ch.show;
             if self.transport.is_simulated() {
-                self.set_mixer_channel_name(i, &ch.name)?;
-            } else {
-                self.state.mixer_channels[i].name = ch.name.clone();
+                report.record(
+                    format!("mixer_channel_name[{i}]"),
+                    self.set_mixer_channel_name(i, &ch.name),
+                )?;
             }
-            self.write_channel_gain_pan(i, ch.level_db, ch.pan)?;
-            self.write_channel_mute(i, ch.mute)?;
-            self.write_channel_solo(i, ch.solo)?;
+            report.record(
+                format!("channel_gain_pan[{i}]"),
+                self.write_channel_gain_pan(i, ch.level_db, ch.pan),
+            )?;
+            report.record(
+                format!("channel_mute[{i}]"),
+                self.write_channel_mute(i, ch.mute),
+            )?;
+            report.record(
+                format!("channel_solo[{i}]"),
+                self.write_channel_solo(i, ch.solo),
+            )?;
         }
 
         if self.transport.is_simulated() {
-            self.set_direct_computer_mix(new_state.monitor.direct_computer_mix)?;
-            self.set_mixer_output_mute(new_state.monitor.mixer_output_mute)?;
-            self.set_mixer_output_solo(new_state.monitor.mixer_output_solo)?;
+            report.record(
+                "direct_computer_mix",
+                self.set_direct_computer_mix(new_state.monitor.direct_computer_mix),
+            )?;
+            report.record(
+                "mixer_output_mute",
+                self.set_mixer_output_mute(new_state.monitor.mixer_output_mute),
+            )?;
+            report.record(
+                "mixer_output_solo",
+                self.set_mixer_output_solo(new_state.monitor.mixer_output_solo),
+            )?;
         }
-        self.set_mixer_output_level_db(new_state.monitor.mixer_output_level_db)?;
-        self.set_speakers_source(new_state.monitor.speakers_source)?;
-        self.set_speakers_mono(new_state.monitor.speakers_mono)?;
-        self.set_phones_source(new_state.monitor.phones_source)?;
-        self.set_phones_mono(new_state.monitor.phones_mono)?;
+        report.record(
+            "mixer_output_level_db",
+            self.set_mixer_output_level_db(new_state.monitor.mixer_output_level_db),
+        )?;
+        report.record(
+            "speakers_source",
+            self.set_speakers_source(new_state.monitor.speakers_source),
+        )?;
+        report.record(
+            "speakers_mono",
+            self.set_speakers_mono(new_state.monitor.speakers_mono),
+        )?;
+        report.record(
+            "phones_source",
+            self.set_phones_source(new_state.monitor.phones_source),
+        )?;
+        report.record(
+            "phones_mono",
+            self.set_phones_mono(new_state.monitor.phones_mono),
+        )?;
 
         for pair in 0..4 {
-            self.set_analog_out_source(pair, new_state.routing.analog_out_sources[pair])?;
-            self.set_adat_out_source(pair, new_state.routing.adat_out_sources[pair])?;
+            report.record(
+                format!("analog_out_source[{pair}]"),
+                self.set_analog_out_source(pair, new_state.routing.analog_out_sources[pair]),
+            )?;
+            report.record(
+                format!("adat_out_source[{pair}]"),
+                self.set_adat_out_source(pair, new_state.routing.adat_out_sources[pair]),
+            )?;
         }
-        self.set_loopback_source(new_state.routing.loopback_source)?;
+        report.record(
+            "loopback_source",
+            self.set_loopback_source(new_state.routing.loopback_source),
+        )?;
 
-        self.state.active_preset_slot = new_state.active_preset_slot;
-        Ok(())
+        if self.is_simulated() {
+            self.state.active_preset_slot = new_state.active_preset_slot;
+        }
+        Ok(report)
     }
 
     /// Query USB DFU Interface 3 status (blocked on live hardware).
